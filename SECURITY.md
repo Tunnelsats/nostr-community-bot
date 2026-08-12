@@ -4,26 +4,42 @@
 
 This project strictly enforces a **Zero Vulnerabilities Policy**. All dependencies, code contributions, and automated security scanning (`npm audit` and Dependabot) must maintain zero high/critical vulnerabilities.
 
-## Supported Versions
-
-Only the latest release version on the `main` branch receives security updates.
-
-| Version | Supported          |
-| ------- | ------------------ |
-| 1.x.x   | :white_check_mark: |
-| < 1.0.0 | :x:                |
-
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability within `nostr-community-bot`, please do **NOT** open a public issue.
+We take the security of TunnelSats and associated software seriously. If you discover a potential vulnerability, please report it to us responsibly.
 
-Instead, please send a report to the maintainers via:
-- **Nostr E2EE DM**: Send a gift-wrapped message (NIP-17/NIP-59) to our Nostr security key.
-- **Email**: Security contact email specified in repo metadata.
+**Please do NOT open a public GitHub issue.**
 
-Include the following in your report:
-1. Description of the vulnerability.
-2. Steps to reproduce the issue.
-3. Potential impact.
+### How to Report a Vulnerability
 
-We will acknowledge receipt within 48 hours and provide a timeline for remediation.
+Please use one of the following methods to report a security vulnerability:
+
+* **Email:** Send an email to `security@tunnelsats.com`.
+* **Nostr:** Send an encrypted direct message (NIP-17 / NIP-59) to [TunnelSats on Nostr](https://snort.social/p/npub1n9z4y3xjramqes8fp9rl96x5e4nl0hff57ynw7vqnjpq370tq78sljsp8y) (`npub1n9z4y3xjramqes8fp9rl96x5e4nl0hff57ynw7vqnjpq370tq78sljsp8y`).
+* **X (Twitter):** Send a direct message to [@TunnelSats](https://x.com/TunnelSats).
+* **Telegram:** Join our Telegram channel (link on our homepage) and send a direct message to an administrator.
+
+### What to Include in Your Report
+
+To help us investigate and address the vulnerability effectively, please include:
+
+1. A clear description of the vulnerability.
+2. Steps to reproduce the vulnerability.
+3. The potential impact of the vulnerability.
+4. The affected version(s) or commit hash.
+5. Your contact information (if you wish to be contacted).
+
+### Our Commitment
+
+* We will acknowledge receipt of your report within 5 business days.
+* We will investigate the reported vulnerability and take appropriate action to address it.
+* We appreciate responsible disclosure and will work with you to resolve the issue.
+
+## Supported Versions
+
+Only the latest active release on the `main` branch receives security updates.
+
+| Version | Supported |
+| ------- | --------- |
+| Main Branch | :white_check_mark: |
+| Older Releases | :warning: |
