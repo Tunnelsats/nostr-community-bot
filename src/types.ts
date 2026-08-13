@@ -7,6 +7,14 @@ export interface NostrBotConfig {
   pubkey?: string;
 }
 
+export type RelayConnectionState = "disconnected" | "connecting" | "connected" | "reconnecting";
+
+export interface RelayConnectionStatus {
+  url: string;
+  state: RelayConnectionState;
+  reconnectAttempts: number;
+}
+
 export interface CommandContext {
   /** Command name executed (without leading slash) */
   command: string;
