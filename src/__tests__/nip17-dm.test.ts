@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { nip44 } from "nostr-tools";
 import {
   finalizeEvent,
+  generateSecretKey,
   getEventHash,
   getPublicKey,
   type NostrEvent,
@@ -13,18 +14,10 @@ import {
   unwrapDirectMessage,
 } from "../nip17-dm.js";
 
-const BOT_SECRET = Uint8Array.from(
-  Buffer.from("a3c06ceaab7c2c3dfe3f0d8f6c36dbd1fe7bca59af71a78f9b24a23acf244d8e", "hex"),
-);
-const SENDER_SECRET = Uint8Array.from(
-  Buffer.from("0beebd062ec8735f4243466049d7747ef5d6594ee838de147f8aab842b15e273", "hex"),
-);
-const OTHER_SECRET = Uint8Array.from(
-  Buffer.from("e108399bd8424357a710b606ae0c13166d853d327e47a6e5e038197346bdbf45", "hex"),
-);
-const WRAPPER_SECRET = Uint8Array.from(
-  Buffer.from("4f02eac59266002db5801adc5270700ca69d5b8f761d8732fab2fbf233c90cbd", "hex"),
-);
+const BOT_SECRET = generateSecretKey();
+const SENDER_SECRET = generateSecretKey();
+const OTHER_SECRET = generateSecretKey();
+const WRAPPER_SECRET = generateSecretKey();
 
 const BOT_PUBKEY = getPublicKey(BOT_SECRET);
 const SENDER_PUBKEY = getPublicKey(SENDER_SECRET);

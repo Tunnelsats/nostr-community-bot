@@ -102,6 +102,7 @@ export function unwrapDirectMessage(
       !HEX_32_BYTES.test(recipientPubkey) ||
       !isNostrEvent(wrap) ||
       wrap.kind !== 1059 ||
+      wrap.content.length > MAX_ENCRYPTED_CONTENT_LENGTH ||
       !hasSingleRecipient(wrap.tags, recipientPubkey) ||
       !verifySignedEvent(wrap)
     ) {

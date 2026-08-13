@@ -1,6 +1,6 @@
 import { beforeEach, describe, it, expect, vi } from "vitest";
-import { nip17 } from "nostr-tools";
-import { getPublicKey, type NostrEvent } from "nostr-tools/pure";
+import { nip17, nip19 } from "nostr-tools";
+import { generateSecretKey, getPublicKey, type NostrEvent } from "nostr-tools/pure";
 import { NostrCommunityBot } from "../bot.js";
 import { unwrapDirectMessage } from "../nip17-dm.js";
 
@@ -20,14 +20,10 @@ vi.mock("nostr-tools/pool", () => ({
   useWebSocketImplementation: relayPoolMocks.useWebSocketImplementation,
 }));
 
-const TEST_NSEC = "nsec150qxe64t0skrml3lpk8kcdkm68l8hjje4ac60rumyj3r4neyfk8qtlv2jl";
 const TEST_RELAYS = ["wss://relay.ditto.pub", "wss://relay.damus.io"];
-const BOT_SECRET = Uint8Array.from(
-  Buffer.from("a3c06ceaab7c2c3dfe3f0d8f6c36dbd1fe7bca59af71a78f9b24a23acf244d8e", "hex"),
-);
-const SENDER_SECRET = Uint8Array.from(
-  Buffer.from("0beebd062ec8735f4243466049d7747ef5d6594ee838de147f8aab842b15e273", "hex"),
-);
+const BOT_SECRET = generateSecretKey();
+const TEST_SECRET_HEX = Buffer.from(BOT_SECRET).toString("hex");
+const SENDER_SECRET = generateSecretKey();
 const SENDER_PUBKEY = getPublicKey(SENDER_SECRET);
 
 function createMockRelay(): {
@@ -64,22 +60,18 @@ beforeEach(() => {
 describe("NostrCommunityBot", () => {
   it("initializes successfully with valid config", () => {
     const bot = new NostrCommunityBot({
-      nsec: TEST_NSEC,
+      nsec: TEST_SECRET_HEX,
       relays: TEST_RELAYS,
     });
 
-    expect(bot.getPublicKeyHex()).toBe(
-      "93929782974e6c9a9cccbc45ac30f1163792c2e74878eab7e7e2777d84354403",
-    );
-    expect(bot.getPublicKeyNpub()).toBe(
-      "npub1jwff0q5hfekf48xvh3z6cv83zcme9sh8fpuw4dl8ufmhmpp4gspsmqg8ct",
-    );
+    expect(bot.getPublicKeyHex()).toBe(getPublicKey(BOT_SECRET));
+    expect(bot.getPublicKeyNpub()).toBe(nip19.npubEncode(getPublicKey(BOT_SECRET)));
     expect(bot.getRelays()).toEqual(TEST_RELAYS);
   });
 
   it("registers and executes commands", async () => {
     const bot = new NostrCommunityBot({
-      nsec: TEST_NSEC,
+      nsec: TEST_SECRET_HEX,
       relays: TEST_RELAYS,
     });
 
@@ -105,7 +97,7 @@ describe("NostrCommunityBot", () => {
 
   it("ignores non-command or unregistered messages", async () => {
     const bot = new NostrCommunityBot({
-      nsec: TEST_NSEC,
+      nsec: TEST_SECRET_HEX,
       relays: TEST_RELAYS,
     });
 
@@ -119,7 +111,7 @@ describe("NostrCommunityBot", () => {
   it("starts configured relays and exposes their connection statuses", async () => {
     relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
     const bot = new NostrCommunityBot({
-      nsec: TEST_NSEC,
+      nsec: TEST_SECRET_HEX,
       relays: TEST_RELAYS,
     });
 
@@ -134,7 +126,7 @@ describe("NostrCommunityBot", () => {
   it("deduplicates repeated relay URLs", async () => {
     relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
     const bot = new NostrCommunityBot({
-      nsec: TEST_NSEC,
+      nsec: TEST_SECRET_HEX,
       relays: [TEST_RELAYS[0], TEST_RELAYS[0]],
     });
 
@@ -150,7 +142,7 @@ describe("NostrCommunityBot", () => {
   it("stops configured relays and returns them to disconnected status", async () => {
     relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
     const bot = new NostrCommunityBot({
-      nsec: TEST_NSEC,
+      nsec: TEST_SECRET_HEX,
       relays: TEST_RELAYS,
     });
     await bot.start();
@@ -167,7 +159,7 @@ describe("NostrCommunityBot", () => {
 
   it("subscribes for gift wraps addressed to the bot", async () => {
     relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
-    const bot = new NostrCommunityBot({ nsec: TEST_NSEC, relays: TEST_RELAYS });
+    const bot = new NostrCommunityBot({ nsec: TEST_SECRET_HEX, relays: TEST_RELAYS });
 
     await bot.start();
 
@@ -179,7 +171,7 @@ describe("NostrCommunityBot", () => {
 
   it("dispatches a validated encrypted command with authenticated context identity", async () => {
     relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
-    const bot = new NostrCommunityBot({ nsec: TEST_NSEC, relays: TEST_RELAYS });
+    const bot = new NostrCommunityBot({ nsec: TEST_SECRET_HEX, relays: TEST_RELAYS });
     const handler = vi.fn();
     bot.registerCommand("ping", handler);
     await bot.start();
@@ -202,7 +194,7 @@ describe("NostrCommunityBot", () => {
 
   it("ignores invalid, non-command, and unregistered encrypted messages", async () => {
     relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
-    const bot = new NostrCommunityBot({ nsec: TEST_NSEC, relays: TEST_RELAYS });
+    const bot = new NostrCommunityBot({ nsec: TEST_SECRET_HEX, relays: TEST_RELAYS });
     const handler = vi.fn();
     bot.registerCommand("ping", handler);
     await bot.start();
@@ -220,7 +212,7 @@ describe("NostrCommunityBot", () => {
 
   it("deduplicates the same gift wrap delivered by multiple relays", async () => {
     relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
-    const bot = new NostrCommunityBot({ nsec: TEST_NSEC, relays: TEST_RELAYS });
+    const bot = new NostrCommunityBot({ nsec: TEST_SECRET_HEX, relays: TEST_RELAYS });
     const handler = vi.fn();
     bot.registerCommand("ping", handler);
     await bot.start();
@@ -234,7 +226,7 @@ describe("NostrCommunityBot", () => {
 
   it("does not let an invalid envelope poison deduplication for a valid event", async () => {
     relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
-    const bot = new NostrCommunityBot({ nsec: TEST_NSEC, relays: TEST_RELAYS });
+    const bot = new NostrCommunityBot({ nsec: TEST_SECRET_HEX, relays: TEST_RELAYS });
     const handler = vi.fn();
     bot.registerCommand("ping", handler);
     await bot.start();
@@ -250,7 +242,7 @@ describe("NostrCommunityBot", () => {
 
   it("isolates handler failures and continues processing later events", async () => {
     relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
-    const bot = new NostrCommunityBot({ nsec: TEST_NSEC, relays: TEST_RELAYS });
+    const bot = new NostrCommunityBot({ nsec: TEST_SECRET_HEX, relays: TEST_RELAYS });
     const handler = vi
       .fn()
       .mockRejectedValueOnce(new Error("handler failed"))
@@ -267,7 +259,7 @@ describe("NostrCommunityBot", () => {
 
   it("does not dispatch an event delivered after stop", async () => {
     relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
-    const bot = new NostrCommunityBot({ nsec: TEST_NSEC, relays: TEST_RELAYS });
+    const bot = new NostrCommunityBot({ nsec: TEST_SECRET_HEX, relays: TEST_RELAYS });
     const handler = vi.fn();
     bot.registerCommand("ping", handler);
     await bot.start();
@@ -285,7 +277,7 @@ describe("NostrCommunityBot", () => {
 
   it("encrypts and publishes replies that reference the inbound rumor", async () => {
     relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
-    const bot = new NostrCommunityBot({ nsec: TEST_NSEC, relays: TEST_RELAYS });
+    const bot = new NostrCommunityBot({ nsec: TEST_SECRET_HEX, relays: TEST_RELAYS });
     bot.registerCommand("ping", async (ctx) => ctx.reply("Pong"));
     await bot.start();
     const inbound = createInboundMessage("/ping", bot.getPublicKeyHex());
@@ -311,7 +303,7 @@ describe("NostrCommunityBot", () => {
       .mockRejectedValueOnce(new Error("first relay secret failure"))
       .mockResolvedValueOnce("saved")
       .mockRejectedValue(new Error("all relays secret failure"));
-    const bot = new NostrCommunityBot({ nsec: TEST_NSEC, relays: TEST_RELAYS });
+    const bot = new NostrCommunityBot({ nsec: TEST_SECRET_HEX, relays: TEST_RELAYS });
     const outcomes: Array<string | Error> = [];
     bot.registerCommand("ping", async (ctx) => {
       try {
@@ -336,7 +328,7 @@ describe("NostrCommunityBot", () => {
 
   it("creates a fresh encrypted event for every reply call", async () => {
     relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
-    const bot = new NostrCommunityBot({ nsec: TEST_NSEC, relays: TEST_RELAYS });
+    const bot = new NostrCommunityBot({ nsec: TEST_SECRET_HEX, relays: TEST_RELAYS });
     bot.registerCommand("ping", async (ctx) => {
       await ctx.reply("first");
       await ctx.reply("second");
