@@ -2,12 +2,15 @@ import { getPublicKey } from "nostr-tools/pure";
 import { nip19 } from "nostr-tools";
 import { NostrBotConfig, CommandHandler, CommandContext } from "./types.js";
 import { parseSecretKey, parseCommand } from "./event-utils.js";
+import { RelayConnectionManager } from "./relay-connection-manager.js";
+import type { RelayConnectionStatus } from "./types.js";
 
 export class NostrCommunityBot {
   private secretKey: Uint8Array;
   private pubkeyHex: string;
   private relays: string[];
   private commands: Map<string, CommandHandler> = new Map();
+  private relayConnections: RelayConnectionManager;
 
   constructor(config: NostrBotConfig) {
     if (!config.nsec) {
@@ -19,7 +22,8 @@ export class NostrCommunityBot {
 
     this.secretKey = parseSecretKey(config.nsec);
     this.pubkeyHex = getPublicKey(this.secretKey);
-    this.relays = config.relays;
+    this.relays = [...new Set(config.relays)];
+    this.relayConnections = new RelayConnectionManager(this.relays);
   }
 
   public getPublicKeyHex(): string {
@@ -32,6 +36,10 @@ export class NostrCommunityBot {
 
   public getRelays(): string[] {
     return [...this.relays];
+  }
+
+  public getRelayStatuses(): RelayConnectionStatus[] {
+    return this.relayConnections.getRelayStatuses();
   }
 
   public registerCommand(name: string, handler: CommandHandler): this {
@@ -77,7 +85,10 @@ export class NostrCommunityBot {
   }
 
   public async start(): Promise<void> {
-    // Connect to Nostr relays and subscribe to incoming NIP-17 / NIP-59 / Concord events
-    // This will be expanded as relay connection handlers are wired in production
+    await this.relayConnections.start();
+  }
+
+  public async stop(): Promise<void> {
+    await this.relayConnections.stop();
   }
 }

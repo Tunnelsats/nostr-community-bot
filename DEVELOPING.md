@@ -17,6 +17,8 @@ Welcome to **`nostr-community-bot`**. This document details the architectural co
 ┌────────────────────────────────────────────────────────┐
 │                 NostrCommunityBot                      │
 │  - Relay Connection Manager                            │
+│    - Per-relay state & exponential reconnect            │
+│    - Graceful socket/timer shutdown                     │
 │  - NIP-17 Encrypted DM Parser                          │
 │  - Command Registry                                    │
 └───────────────────────────┬────────────────────────────┘
@@ -29,9 +31,18 @@ Welcome to **`nostr-community-bot`**. This document details the architectural co
 ```
 
 ### Core Features
+
 - **NIP-17 & NIP-59 Encrypted Direct Messages**: Client-side E2EE message processing.
 - **Pluggable Command Registry**: Register slash commands (`/ping`, `/info`, `/tunnelsats`, `/link`) using `bot.registerCommand(name, handler)`.
 - **Event Relay Bus**: Automatic reconnection, event deduplication, and payload verification.
+
+### Relay lifecycle ownership
+
+`NostrCommunityBot` owns one internal relay connection manager. Calling `start()` attempts every configured relay concurrently, keeps failures isolated per relay, and maintains live connections with bounded exponential reconnect delays. Calling `stop()` disables reconnection before closing the pool, cancels pending connection attempts and retry timers, and returns relay states to `disconnected`.
+
+Use `getRelayStatuses()` for an immutable status snapshot. Future event subscriptions and publishing paths should reuse the manager-owned `SimplePool`; they must not create a second pool or a competing reconnect loop.
+
+Automated tests use typed pool/relay fakes and Vitest fake timers. Do not depend on public relay availability in CI.
 
 ---
 
@@ -56,6 +67,7 @@ We enforce a strict **Test-Driven Development (TDD)** cycle:
 ```
 
 ### Running Tests
+
 We use **Vitest** for fast unit and integration testing.
 
 ```bash

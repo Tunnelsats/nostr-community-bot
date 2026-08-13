@@ -43,8 +43,24 @@ bot.registerCommand("ping", async (ctx) => {
 
 // Start listening
 await bot.start();
+console.log(bot.getRelayStatuses());
 console.log("Nostr Community Bot is running!");
+
+// Close sockets and cancel reconnect attempts during process shutdown.
+const shutdown = async () => {
+  try {
+    await bot.stop();
+  } catch (error) {
+    console.error("Failed to stop Nostr Community Bot cleanly:", error);
+    process.exitCode = 1;
+  }
+};
+
+process.once("SIGINT", () => void shutdown());
+process.once("SIGTERM", () => void shutdown());
 ```
+
+`start()` connects to all configured relays concurrently. If one relay is unavailable, the bot keeps healthy connections open and retries the failed relay with bounded exponential backoff. `getRelayStatuses()` returns a snapshot of each relay's current state, and `stop()` is safe to call repeatedly.
 
 ---
 
