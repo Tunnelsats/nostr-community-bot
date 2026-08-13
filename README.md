@@ -38,6 +38,8 @@ const bot = new NostrCommunityBot({
 // Register a custom command
 bot.registerCommand("ping", async (ctx) => {
   const target = ctx.args[0] || "node";
+  // For a NIP-17 DM, reply() creates a fresh encrypted gift wrap addressed
+  // to the authenticated sender and links it to the incoming private rumor.
   await ctx.reply(`Pong! Pinging ${target} from Nostr Community Bot...`);
 });
 
@@ -60,7 +62,11 @@ process.once("SIGINT", () => void shutdown());
 process.once("SIGTERM", () => void shutdown());
 ```
 
-`start()` connects to all configured relays concurrently. If one relay is unavailable, the bot keeps healthy connections open and retries the failed relay with bounded exponential backoff. `getRelayStatuses()` returns a snapshot of each relay's current state, and `stop()` is safe to call repeatedly.
+`start()` connects to all configured relays concurrently and subscribes for NIP-59 `kind:1059` gift wraps addressed to the bot. Valid NIP-17 `kind:14` rumors are decrypted locally and dispatched through the command registry. The command context identifies the authenticated rumor author—not the gift wrap's random public key—and `ctx.reply()` encrypts a fresh NIP-17 response before publishing it.
+
+If one relay is unavailable, the bot keeps healthy connections open and retries the failed relay with bounded exponential backoff. Encrypted subscriptions are restored after reconnect, and duplicate delivery of the same gift wrap across relays is processed once per running lifecycle. `getRelayStatuses()` returns a snapshot of each relay's current state, and `stop()` is safe to call repeatedly.
+
+Reply events are currently published to the configured relay set. Applications that require full NIP-17 inbox routing must add recipient `kind:10050` DM relay discovery before sending. Keep the bot `nsec` in a secret store or `.env` file: never log it, pass it through a command context, or commit it to source control.
 
 ---
 

@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { Filter, NostrEvent } from "nostr-tools";
 import {
   RelayConnectionManager,
   type RelayLike,
   type RelayPoolLike,
+  type RelaySubscriptionLike,
 } from "../relay-connection-manager.js";
 
 const RELAYS = ["wss://relay.one", "wss://relay.two"];
@@ -24,13 +26,78 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve, reject };
 }
 
+class FakeSubscription implements RelaySubscriptionLike {
+  public closed = false;
+
+  public constructor(private readonly closeError?: Error) {}
+
+  public close(): void {
+    this.closed = true;
+    if (this.closeError) {
+      throw this.closeError;
+    }
+  }
+}
+
 class FakeRelay implements RelayLike {
   public onclose: (() => void) | null = null;
+  public subscribeCalls: Array<{
+    filters: Filter[];
+    onevent: (event: NostrEvent) => void;
+    subscription: FakeSubscription;
+  }> = [];
+  public publishCalls: NostrEvent[] = [];
+
+  public constructor(
+    private readonly publishResult: (event: NostrEvent) => Promise<string> = async () => "saved",
+    private readonly subscriptionError?: Error,
+    private readonly subscriptionCloseError?: Error,
+  ) {}
+
+  public subscribe(
+    filters: Filter[],
+    params: { onevent?: (event: NostrEvent) => void },
+  ): FakeSubscription {
+    if (this.subscriptionError) {
+      throw this.subscriptionError;
+    }
+    const subscription = new FakeSubscription(this.subscriptionCloseError);
+    this.subscribeCalls.push({
+      filters,
+      onevent: params.onevent ?? (() => {}),
+      subscription,
+    });
+    return subscription;
+  }
+
+  public publish(event: NostrEvent): Promise<string> {
+    this.publishCalls.push(event);
+    return this.publishResult(event);
+  }
+
+  public emit(event: NostrEvent): void {
+    for (const subscription of this.subscribeCalls) {
+      if (!subscription.subscription.closed) {
+        subscription.onevent(event);
+      }
+    }
+  }
 
   public drop(): void {
     this.onclose?.();
   }
 }
+
+const GIFT_WRAP_FILTER: Filter = { kinds: [1059], "#p": ["ab".repeat(32)] };
+const TEST_EVENT: NostrEvent = {
+  id: "01".repeat(32),
+  pubkey: "02".repeat(32),
+  created_at: 1_700_000_000,
+  kind: 1059,
+  tags: [["p", "ab".repeat(32)]],
+  content: "ciphertext",
+  sig: "03".repeat(64),
+};
 
 class FakePool implements RelayPoolLike {
   public ensureRelayCalls: string[] = [];
@@ -417,5 +484,217 @@ describe("RelayConnectionManager lifecycle", () => {
     expect(pools[0].closeCalls).toEqual([[RELAYS[0]]]);
     expect(pools[1].ensureRelayCalls).toEqual([RELAYS[0]]);
     expect(manager.getRelayStatuses()[0].state).toBe("connected");
+  });
+});
+
+describe("RelayConnectionManager subscriptions and publishing", () => {
+  it("attaches one persistent subscription per connected relay", async () => {
+    const relays = [new FakeRelay(), new FakeRelay()];
+    let nextRelay = 0;
+    const pool = new FakePool(async () => relays[nextRelay++]);
+    const manager = new RelayConnectionManager(RELAYS, () => pool);
+    manager.registerSubscription(GIFT_WRAP_FILTER, () => {});
+
+    await manager.start();
+
+    for (const relay of relays) {
+      expect(relay.subscribeCalls).toHaveLength(1);
+      expect(relay.subscribeCalls[0].filters).toEqual([GIFT_WRAP_FILTER]);
+    }
+  });
+
+  it("reattaches only a dropped relay subscription after reconnect", async () => {
+    vi.useFakeTimers();
+    const first = new FakeRelay();
+    const second = new FakeRelay();
+    const replacement = new FakeRelay();
+    const byUrl = new Map<string, FakeRelay[]>([
+      [RELAYS[0], [first, replacement]],
+      [RELAYS[1], [second]],
+    ]);
+    const pool = new FakePool(async (url) => {
+      const relay = byUrl.get(url)?.shift();
+      if (!relay) {
+        throw new Error("Unexpected connection");
+      }
+      return relay;
+    });
+    const manager = new RelayConnectionManager(RELAYS, () => pool);
+    manager.registerSubscription(GIFT_WRAP_FILTER, () => {});
+    await manager.start();
+
+    first.drop();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(first.subscribeCalls[0].subscription.closed).toBe(true);
+    expect(replacement.subscribeCalls).toHaveLength(1);
+    expect(second.subscribeCalls).toHaveLength(1);
+  });
+
+  it("does not duplicate subscriptions across concurrent starts", async () => {
+    const connection = deferred<RelayLike>();
+    const relay = new FakeRelay();
+    const pool = new FakePool(async () => connection.promise);
+    const manager = new RelayConnectionManager([RELAYS[0]], () => pool);
+    manager.registerSubscription(GIFT_WRAP_FILTER, () => {});
+
+    const firstStart = manager.start();
+    const secondStart = manager.start();
+    connection.resolve(relay);
+    await Promise.all([firstStart, secondStart]);
+
+    expect(relay.subscribeCalls).toHaveLength(1);
+  });
+
+  it("removes and reconnects a relay when subscription attachment fails", async () => {
+    vi.useFakeTimers();
+    const failedRelay = new FakeRelay(
+      async () => "must not publish",
+      new Error("subscription failed"),
+    );
+    const replacement = new FakeRelay();
+    const relays = [failedRelay, replacement];
+    const pool = new FakePool(async () => {
+      const relay = relays.shift();
+      if (!relay) {
+        throw new Error("Unexpected connection");
+      }
+      return relay;
+    });
+    const manager = new RelayConnectionManager([RELAYS[0]], () => pool);
+    manager.registerSubscription(GIFT_WRAP_FILTER, () => {});
+
+    await manager.start();
+
+    expect(manager.getRelayStatuses()[0].state).toBe("reconnecting");
+    expect(pool.closeCalls).toEqual([[RELAYS[0]]]);
+    await expect(manager.publish(TEST_EVENT)).rejects.toThrow("Relay publication failed");
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(replacement.subscribeCalls).toHaveLength(1);
+    expect(manager.getRelayStatuses()[0].state).toBe("connected");
+  });
+
+  it("closes subscriptions on stop and attaches fresh handles after restart", async () => {
+    const relays: FakeRelay[] = [];
+    const manager = new RelayConnectionManager([RELAYS[0]], () => {
+      const relay = new FakeRelay();
+      relays.push(relay);
+      return new FakePool(async () => relay);
+    });
+    manager.registerSubscription(GIFT_WRAP_FILTER, () => {});
+
+    await manager.start();
+    await manager.stop();
+    expect(relays[0].subscribeCalls[0].subscription.closed).toBe(true);
+
+    await manager.start();
+    expect(relays[1].subscribeCalls).toHaveLength(1);
+  });
+
+  it("continues pool cleanup when a subscription close callback throws", async () => {
+    const relay = new FakeRelay(
+      async () => "saved",
+      undefined,
+      new Error("subscription close failed"),
+    );
+    const pool = new FakePool(async () => relay);
+    const manager = new RelayConnectionManager([RELAYS[0]], () => pool);
+    manager.registerSubscription(GIFT_WRAP_FILTER, () => {});
+    await manager.start();
+
+    await expect(manager.stop()).resolves.toBeUndefined();
+
+    expect(pool.closeCalls).toEqual([[RELAYS[0]]]);
+    expect(manager.getRelayStatuses()[0].state).toBe("disconnected");
+  });
+
+  it("reconnects even when the pool's relay close callback throws", async () => {
+    vi.useFakeTimers();
+    const first = new FakeRelay();
+    first.onclose = () => {
+      throw new Error("pool close callback failed");
+    };
+    const replacement = new FakeRelay();
+    const relays = [first, replacement];
+    const pool = new FakePool(async () => {
+      const relay = relays.shift();
+      if (!relay) {
+        throw new Error("Unexpected connection");
+      }
+      return relay;
+    });
+    const manager = new RelayConnectionManager([RELAYS[0]], () => pool);
+    manager.registerSubscription(GIFT_WRAP_FILTER, () => {});
+    await manager.start();
+
+    expect(() => first.drop()).not.toThrow();
+    expect(manager.getRelayStatuses()[0].state).toBe("reconnecting");
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(replacement.subscribeCalls).toHaveLength(1);
+  });
+
+  it("waits for an in-flight async event handler during stop", async () => {
+    const handler = deferred<void>();
+    const relay = new FakeRelay();
+    const pool = new FakePool(async () => relay);
+    const manager = new RelayConnectionManager([RELAYS[0]], () => pool);
+    manager.registerSubscription(GIFT_WRAP_FILTER, async () => handler.promise);
+    await manager.start();
+    relay.emit(TEST_EVENT);
+
+    let stopped = false;
+    const stopPromise = manager.stop().then(() => {
+      stopped = true;
+    });
+    await Promise.resolve();
+    expect(stopped).toBe(false);
+
+    handler.resolve();
+    await stopPromise;
+    expect(stopped).toBe(true);
+  });
+
+  it("publishes concurrently and succeeds when at least one relay acknowledges", async () => {
+    const firstPublish = deferred<string>();
+    const secondPublish = deferred<string>();
+    const relays = [
+      new FakeRelay(async () => firstPublish.promise),
+      new FakeRelay(async () => secondPublish.promise),
+    ];
+    let nextRelay = 0;
+    const pool = new FakePool(async () => relays[nextRelay++]);
+    const manager = new RelayConnectionManager(RELAYS, () => pool);
+    await manager.start();
+
+    const publishPromise = manager.publish(TEST_EVENT);
+    await Promise.resolve();
+    expect(relays[0].publishCalls).toEqual([TEST_EVENT]);
+    expect(relays[1].publishCalls).toEqual([TEST_EVENT]);
+
+    firstPublish.reject(new Error("first relay failed"));
+    secondPublish.resolve("saved");
+    await expect(publishPromise).resolves.toBeUndefined();
+  });
+
+  it("rejects publication safely when no relay accepts the event", async () => {
+    const disconnected = new RelayConnectionManager([RELAYS[0]], () => {
+      throw new Error("not started");
+    });
+    await expect(disconnected.publish(TEST_EVENT)).rejects.toThrow("Relay publication failed");
+
+    const relay = new FakeRelay(async () => {
+      throw new Error("sensitive relay failure");
+    });
+    const pool = new FakePool(async () => relay);
+    const connected = new RelayConnectionManager([RELAYS[0]], () => pool);
+    await connected.start();
+
+    await expect(connected.publish(TEST_EVENT)).rejects.toThrow("Relay publication failed");
+    await connected.publish(TEST_EVENT).catch((error: unknown) => {
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).not.toContain("sensitive");
+    });
   });
 });
