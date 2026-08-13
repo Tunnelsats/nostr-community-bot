@@ -20,6 +20,8 @@ Welcome to **`nostr-community-bot`**. This document details the architectural co
 │    - Per-relay state & exponential reconnect            │
 │    - Graceful socket/timer shutdown                     │
 │  - NIP-17 Encrypted DM Parser                          │
+│    - Strict gift wrap / seal / rumor validation        │
+│    - Per-run cross-relay event deduplication            │
 │  - Command Registry                                    │
 └───────────────────────────┬────────────────────────────┘
                             │ (Typed CommandContext)
@@ -38,11 +40,31 @@ Welcome to **`nostr-community-bot`**. This document details the architectural co
 
 ### Relay lifecycle ownership
 
-`NostrCommunityBot` owns one internal relay connection manager. Calling `start()` attempts every configured relay concurrently, keeps failures isolated per relay, and maintains live connections with bounded exponential reconnect delays. Calling `stop()` disables reconnection before closing the pool, cancels pending connection attempts and retry timers, and returns relay states to `disconnected`.
+`NostrCommunityBot` owns one internal relay connection manager. Calling `start()` attempts every configured relay concurrently, keeps failures isolated per relay, and maintains live connections with bounded exponential reconnect delays. Calling `stop()` disables event dispatch and reconnection before closing subscriptions and the pool, cancels pending connection attempts and retry timers, settles tracked event work, and returns relay states to `disconnected`.
 
-Use `getRelayStatuses()` for an immutable status snapshot. Future event subscriptions and publishing paths should reuse the manager-owned `SimplePool`; they must not create a second pool or a competing reconnect loop.
+Use `getRelayStatuses()` for an immutable status snapshot. Event subscriptions and publishing reuse the manager-owned `SimplePool` and connected relay objects; they must not create a second pool or a competing reconnect loop. Persistent subscription definitions attach once to each connected relay and are reattached only for the relay that reconnects. Reply publication fans out concurrently and succeeds when at least one connected relay acknowledges the event.
 
 Automated tests use typed pool/relay fakes and Vitest fake timers. Do not depend on public relay availability in CI.
+
+### Encrypted direct-message validation
+
+Inbound direct messages use the full NIP-59 trust chain before command parsing:
+
+```text
+verified kind 1059 gift wrap, p-tagged to bot
+  -> NIP-44 decrypt with bot secret and one-time wrapper pubkey
+verified kind 13 seal, signed by real sender, with empty tags
+  -> NIP-44 decrypt with bot secret and seal pubkey
+unsigned kind 14 rumor, p-tagged to bot, with a valid event hash
+```
+
+The seal pubkey must equal the rumor pubkey. That verified identity becomes `CommandContext.senderPubkey`, while `CommandContext.eventId` is the private rumor ID used by encrypted replies. Never derive sender identity from the random outer gift-wrap pubkey.
+
+Decrypted JSON is untrusted input. Narrow it from `unknown`, bound encrypted payload sizes before NIP-44 work, validate every event/hash/signature/tag invariant, and collapse protocol failures to sanitized errors. Never log secret-key bytes, ciphertext, decrypted commands, reply plaintext, or raw inner events.
+
+The same verified outer event ID may arrive from several relays, so the bot uses a bounded per-run deduplication cache before executing handlers. The cache survives reconnects and is cleared after a completed stop. Async subscription handlers are isolated so one malformed event or rejected command cannot prevent later events from being processed.
+
+`ctx.reply()` uses a fresh NIP-17 wrapper for every call and includes an `e` reply tag for the triggering rumor. It currently publishes to the configured relay set. Recipient `kind:10050` DM relay discovery is outside this slice and is required before describing the routing layer as fully NIP-17 compliant.
 
 ---
 
