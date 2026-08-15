@@ -78,11 +78,12 @@ Cap the number of rendered addresses and the final response length with named co
 ### `/ping <pubkey>`
 
 1. Apply the same exact argument validation and normalization.
-2. Check the existing rate limiter with `nostr:${ctx.senderPubkey}`. If denied, reply with the existing retry-after semantics and do not call gossip or LND.
-3. Call `lookupNodeAddresses(pubkey)` to resolve announced sockets. Deduplicate them and select one deterministically: prefer the first clearnet address, otherwise use the first onion address. Parallel probes for the same pubkey are prohibited because `pingNode()` adds and removes the same LND peer and concurrent attempts can interfere with each other.
-4. Send a short encrypted acknowledgement naming only the public Lightning node key and selected address type, then record the allowed request immediately before starting the expensive probe.
-5. Construct `${pubkey}@${selectedAddress.socket}` and call `pingNode()` from `ping-service.ts`.
-6. Return a final encrypted plain-text result containing success/failure, measured latency when available, safe alias/channel values, selected address type/socket, the existing probe disclaimer, and the deployment's single-region latency caveat.
+2. Reject a duplicate in-flight probe for the same target pubkey before consuming sender quota. This prevents overlapping LND `addPeer`/`removePeer` operations for one node.
+3. Check the existing rate limiter with `nostr:${ctx.senderPubkey}`. If denied, reply with the existing retry-after semantics and do not call gossip or LND. If allowed, record the request synchronously in the same JavaScript turn, with no `await` between checking and recording. This reservation must happen before gossip lookup or an encrypted acknowledgement so concurrent commands from one sender cannot pass against the same quota snapshot.
+4. Call `lookupNodeAddresses(pubkey)` to resolve announced sockets. Deduplicate them and select one deterministically: prefer the first clearnet address, otherwise use the first onion address. The reserved quota remains consumed if lookup finds no address or fails, because the command has already admitted network work.
+5. Send a short encrypted acknowledgement naming only the public Lightning node key and selected address type.
+6. Construct `${pubkey}@${selectedAddress.socket}` and call `pingNode()` from `ping-service.ts`.
+7. Return a final encrypted plain-text result containing success/failure, measured latency when available, safe alias/channel values, selected address type/socket, the existing probe disclaimer, and the deployment's single-region latency caveat.
 
 The deterministic single-address rule keeps one command within one rate-limit unit and avoids an unbounded sequence of 20/45-second probes. If product requirements later demand trying every announced socket, add an explicit command option, total deadline, probe cap, and per-address accounting rather than silently expanding this slice.
 
@@ -207,8 +208,10 @@ Cover:
 - rate-limit identity is `nostr:<authenticated sender pubkey>`, never the gift-wrap pubkey or Lightning target;
 - a denied request returns retry timing and calls neither gossip nor `pingNode()`;
 - address selection is stable, prefers clearnet, and falls back to onion;
-- no address produces a safe failure without recording a probe;
-- the acknowledgement is sent before the rate limit is recorded and before LND starts;
+- duplicate in-flight probes for the same target return a busy response without consuming quota;
+- an allowed request is recorded synchronously before the first awaited gossip/reply operation;
+- overlapping commands from the same sender cannot over-admit against one quota snapshot;
+- no address and gossip failure produce safe replies after consuming the reserved request;
 - `pingNode()` receives the exact normalized `pubkey@socket`;
 - success formats latency/alias/channels/address type and the probe disclaimer;
 - timeout/connect failure and unexpected throw produce sanitized encrypted responses;
@@ -218,7 +221,7 @@ Expand `ping-service.test.ts` to cover LND call ordering, timeout selection, cle
 
 **Green**
 
-- Implement deterministic selection, rate-limit integration, acknowledgement, probe, and final formatting.
+- Implement deterministic selection, synchronous quota reservation, acknowledgement, probe, and final formatting.
 
 **Refactor**
 
@@ -322,7 +325,7 @@ npm audit
 
 - **Transport coupling:** calling Telegraf actions from Nostr would require fake chat contexts and could leak HTML. Use service-level functions plus Nostr-specific plain-text handlers.
 - **Peer-operation races:** probing several addresses for the same pubkey concurrently can make `addPeer`/`removePeer` interfere. Select one address deterministically and run one probe per command.
-- **Abuse of LND/network resources:** rate-limit by authenticated Nostr sender before gossip/LND work and record each accepted probe.
+- **Abuse of LND/network resources:** rate-limit by authenticated Nostr sender and synchronously reserve an allowed request before any awaited gossip/reply work. Cover concurrent commands so separate targets cannot over-admit against one quota snapshot.
 - **False negatives from address choice:** expose the selected address in the response and document the one-address policy; add explicit multi-address behavior only with a bounded design.
 - **Oversized gossip responses:** cap rendered addresses and response size, and report omissions.
 - **Error/privacy leakage:** use fixed user-facing failure categories and never log nsec material, decrypted messages, raw events, or sender-command pairs.
