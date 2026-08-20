@@ -66,6 +66,32 @@ process.once("SIGTERM", () => void shutdown());
 
 If one relay is unavailable, the bot keeps healthy connections open and retries the failed relay with bounded exponential backoff. Encrypted subscriptions are restored after reconnect, and duplicate delivery of the same gift wrap across relays is processed once per running lifecycle. `getRelayStatuses()` returns a snapshot of each relay's current state, and `stop()` is safe to call repeatedly.
 
+Historical DM intake is bounded to five minutes by default. For restart-safe command handling,
+configure a durable processed-event store:
+
+```typescript
+import type { ProcessedEventStore } from "nostr-community-bot";
+
+const processedEvents: ProcessedEventStore = {
+  isProcessed: async (eventId) => database.has(eventId),
+  markProcessed: async (eventId) => database.insertIfAbsent(eventId),
+};
+
+const bot = new NostrCommunityBot({
+  nsec: "nsec1...",
+  relays: ["wss://relay.ditto.pub"],
+  directMessageReplay: {
+    offlineGraceSeconds: 300,
+    store: processedEvents,
+  },
+});
+```
+
+`markProcessed` runs before command dispatch. For overlapping bot processes, it must atomically
+insert the authenticated inner-rumor ID and return `false` when that ID was already claimed. Store
+errors fail closed, so commands are not dispatched when durable deduplication is unavailable. The
+offline grace may be configured from 0 to 604800 seconds (seven days).
+
 Reply events are currently published to the configured relay set. Applications that require full NIP-17 inbox routing must add recipient `kind:10050` DM relay discovery before sending. Keep the bot `nsec` in a secret store or `.env` file: never log it, pass it through a command context, or commit it to source control.
 
 ---
