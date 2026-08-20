@@ -1,5 +1,5 @@
 import { beforeEach, describe, it, expect, vi } from "vitest";
-import { nip17, nip19 } from "nostr-tools";
+import { nip17, nip19, nip59 } from "nostr-tools";
 import { generateSecretKey, getPublicKey, type NostrEvent } from "nostr-tools/pure";
 import { NostrCommunityBot } from "../bot.js";
 import { unwrapDirectMessage } from "../nip17-dm.js";
@@ -42,6 +42,19 @@ function createInboundMessage(message: string, botPubkey: string): NostrEvent {
   return nip17.wrapEvent(SENDER_SECRET, { publicKey: botPubkey }, message);
 }
 
+function createInboundMessageAt(message: string, botPubkey: string, createdAt: number): NostrEvent {
+  return nip59.wrapManyEvents(
+    {
+      kind: 14,
+      created_at: createdAt,
+      tags: [["p", botPubkey]],
+      content: message,
+    },
+    SENDER_SECRET,
+    [botPubkey],
+  )[1];
+}
+
 function emitSubscriptionEvent(callIndex: number, event: NostrEvent): void {
   const params = relayPoolMocks.subscribe.mock.calls[callIndex]?.[1] as
     { onevent?: (received: NostrEvent) => void } | undefined;
@@ -68,6 +81,20 @@ describe("NostrCommunityBot", () => {
     expect(bot.getPublicKeyNpub()).toBe(nip19.npubEncode(getPublicKey(BOT_SECRET)));
     expect(bot.getRelays()).toEqual(TEST_RELAYS);
   });
+
+  it.each([-1, 604_801, 1.5, Number.NaN])(
+    "rejects an invalid direct-message offline grace of %s seconds",
+    (offlineGraceSeconds) => {
+      expect(
+        () =>
+          new NostrCommunityBot({
+            nsec: TEST_SECRET_HEX,
+            relays: TEST_RELAYS,
+            directMessageReplay: { offlineGraceSeconds },
+          }),
+      ).toThrow("direct-message offline grace");
+    },
+  );
 
   it("registers and executes commands", async () => {
     const bot = new NostrCommunityBot({
@@ -159,14 +186,184 @@ describe("NostrCommunityBot", () => {
 
   it("subscribes for gift wraps addressed to the bot", async () => {
     relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
+    const now = 1_800_000_000;
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now * 1_000);
     const bot = new NostrCommunityBot({ nsec: TEST_SECRET_HEX, relays: TEST_RELAYS });
+    nowSpy.mockRestore();
 
     await bot.start();
 
     expect(relayPoolMocks.subscribe).toHaveBeenCalledTimes(TEST_RELAYS.length);
     for (const [filters] of relayPoolMocks.subscribe.mock.calls) {
-      expect(filters).toEqual([{ kinds: [1059], "#p": [bot.getPublicKeyHex()] }]);
+      expect(filters).toEqual([
+        {
+          kinds: [1059],
+          "#p": [bot.getPublicKeyHex()],
+          since: now - 300 - 2 * 24 * 60 * 60,
+        },
+      ]);
     }
+  });
+
+  it("discards authenticated direct messages older than the configured offline window", async () => {
+    relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
+    const now = Math.floor(Date.now() / 1_000);
+    const bot = new NostrCommunityBot({
+      nsec: TEST_SECRET_HEX,
+      relays: TEST_RELAYS,
+      directMessageReplay: { offlineGraceSeconds: 60 },
+    });
+    const handler = vi.fn();
+    bot.registerCommand("ping", handler);
+    await bot.start();
+
+    emitSubscriptionEvent(
+      0,
+      createInboundMessageAt("/ping stale", bot.getPublicKeyHex(), now - 61),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("keeps the authenticated rumor cutoff bounded during a long-running process", async () => {
+    relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
+    const startup = 1_800_000_000;
+    const startupClock = vi.spyOn(Date, "now").mockReturnValue(startup * 1_000);
+    const bot = new NostrCommunityBot({
+      nsec: TEST_SECRET_HEX,
+      relays: TEST_RELAYS,
+      directMessageReplay: { offlineGraceSeconds: 60 },
+    });
+    startupClock.mockRestore();
+    const handler = vi.fn();
+    bot.registerCommand("ping", handler);
+    await bot.start();
+    const laterClock = vi.spyOn(Date, "now").mockReturnValue((startup + 120) * 1_000);
+
+    emitSubscriptionEvent(
+      0,
+      createInboundMessageAt("/ping expired", bot.getPublicKeyHex(), startup + 1),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    laterClock.mockRestore();
+
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("rejects authenticated rumors too far in the future", async () => {
+    relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
+    const now = Math.floor(Date.now() / 1_000);
+    const bot = new NostrCommunityBot({ nsec: TEST_SECRET_HEX, relays: TEST_RELAYS });
+    const handler = vi.fn();
+    bot.registerCommand("ping", handler);
+    await bot.start();
+
+    emitSubscriptionEvent(
+      0,
+      createInboundMessageAt("/ping future", bot.getPublicKeyHex(), now + 301),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("uses a persistent store to suppress a rewrapped rumor across bot instances", async () => {
+    relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
+    const processed = new Set<string>();
+    const store = {
+      isProcessed: vi.fn((eventId: string) => processed.has(eventId)),
+      markProcessed: vi.fn((eventId: string) => {
+        processed.add(eventId);
+      }),
+    };
+    const first = new NostrCommunityBot({
+      nsec: TEST_SECRET_HEX,
+      relays: TEST_RELAYS,
+      directMessageReplay: { store },
+    });
+    const wrap = createInboundMessage("/ping once", first.getPublicKeyHex());
+    const rumor = unwrapDirectMessage(wrap, BOT_SECRET, first.getPublicKeyHex());
+    const firstHandler = vi.fn(() => {
+      expect(processed.has(rumor.id)).toBe(true);
+    });
+    first.registerCommand("ping", firstHandler);
+    await first.start();
+
+    emitSubscriptionEvent(0, wrap);
+    await vi.waitFor(() => expect(firstHandler).toHaveBeenCalledTimes(1));
+    expect(store.markProcessed).toHaveBeenCalledWith(rumor.id);
+    await first.stop();
+
+    const second = new NostrCommunityBot({
+      nsec: TEST_SECRET_HEX,
+      relays: TEST_RELAYS,
+      directMessageReplay: { store },
+    });
+    const secondHandler = vi.fn();
+    second.registerCommand("ping", secondHandler);
+    await second.start();
+    const rewrapped = nip59.wrapManyEvents(
+      {
+        kind: 14,
+        created_at: rumor.created_at,
+        tags: rumor.tags,
+        content: rumor.content,
+      },
+      SENDER_SECRET,
+      [second.getPublicKeyHex()],
+    )[1];
+    emitSubscriptionEvent(TEST_RELAYS.length, rewrapped);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(rewrapped.id).not.toBe(wrap.id);
+    expect(store.isProcessed).toHaveBeenCalledWith(rumor.id);
+    expect(secondHandler).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the persistent processed-event store is unavailable", async () => {
+    relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
+    const bot = new NostrCommunityBot({
+      nsec: TEST_SECRET_HEX,
+      relays: TEST_RELAYS,
+      directMessageReplay: {
+        store: {
+          isProcessed: vi.fn(() => Promise.reject(new Error("database unavailable"))),
+          markProcessed: vi.fn(),
+        },
+      },
+    });
+    const handler = vi.fn();
+    bot.registerCommand("ping", handler);
+    await bot.start();
+
+    emitSubscriptionEvent(0, createInboundMessage("/ping blocked", bot.getPublicKeyHex()));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(handler).not.toHaveBeenCalled();
+    expect(relayPoolMocks.publish).not.toHaveBeenCalled();
+  });
+
+  it("dispatches only when the persistent store atomically claims the rumor", async () => {
+    relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
+    const store = {
+      isProcessed: vi.fn(() => false),
+      markProcessed: vi.fn(() => false),
+    };
+    const bot = new NostrCommunityBot({
+      nsec: TEST_SECRET_HEX,
+      relays: TEST_RELAYS,
+      directMessageReplay: { store },
+    });
+    const handler = vi.fn();
+    bot.registerCommand("ping", handler);
+    await bot.start();
+
+    emitSubscriptionEvent(0, createInboundMessage("/ping raced", bot.getPublicKeyHex()));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(store.markProcessed).toHaveBeenCalledTimes(1);
+    expect(handler).not.toHaveBeenCalled();
   });
 
   it("dispatches a validated encrypted command with authenticated context identity", async () => {

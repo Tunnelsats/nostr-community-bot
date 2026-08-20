@@ -1,6 +1,11 @@
 import { getPublicKey } from "nostr-tools/pure";
 import { nip19 } from "nostr-tools";
-import { NostrBotConfig, CommandHandler, CommandContext } from "./types.js";
+import {
+  NostrBotConfig,
+  CommandHandler,
+  CommandContext,
+  type ProcessedEventStore,
+} from "./types.js";
 import { parseSecretKey, parseCommand } from "./event-utils.js";
 import { RelayConnectionManager } from "./relay-connection-manager.js";
 import type { RelayConnectionStatus } from "./types.js";
@@ -8,6 +13,10 @@ import type { NostrEvent } from "nostr-tools/pure";
 import { createDirectMessageReply, unwrapDirectMessage } from "./nip17-dm.js";
 
 const PROCESSED_EVENT_CACHE_LIMIT = 1_024;
+const DEFAULT_DM_OFFLINE_GRACE_SECONDS = 5 * 60;
+const MAX_DM_OFFLINE_GRACE_SECONDS = 7 * 24 * 60 * 60;
+const NIP59_GIFT_WRAP_BACKDATE_SECONDS = 2 * 24 * 60 * 60;
+const MAX_DM_FUTURE_SKEW_SECONDS = 5 * 60;
 
 export class NostrCommunityBot {
   private secretKey: Uint8Array;
@@ -17,6 +26,9 @@ export class NostrCommunityBot {
   private relayConnections: RelayConnectionManager;
   private processedEventIds = new Set<string>();
   private acceptingRelayEvents = false;
+  private readonly directMessageCutoff: number;
+  private readonly directMessageOfflineGraceSeconds: number;
+  private readonly processedEventStore: ProcessedEventStore | undefined;
 
   constructor(config: NostrBotConfig) {
     if (!config.nsec) {
@@ -29,9 +41,29 @@ export class NostrCommunityBot {
     this.secretKey = parseSecretKey(config.nsec);
     this.pubkeyHex = getPublicKey(this.secretKey);
     this.relays = [...new Set(config.relays)];
+    const offlineGraceSeconds =
+      config.directMessageReplay?.offlineGraceSeconds ?? DEFAULT_DM_OFFLINE_GRACE_SECONDS;
+    if (
+      !Number.isSafeInteger(offlineGraceSeconds) ||
+      offlineGraceSeconds < 0 ||
+      offlineGraceSeconds > MAX_DM_OFFLINE_GRACE_SECONDS
+    ) {
+      throw new Error(
+        `NostrBotConfig error: direct-message offline grace must be an integer from 0 to ${MAX_DM_OFFLINE_GRACE_SECONDS}.`,
+      );
+    }
+    const startupTime = Math.floor(Date.now() / 1_000);
+    this.directMessageCutoff = startupTime - offlineGraceSeconds;
+    this.directMessageOfflineGraceSeconds = offlineGraceSeconds;
+    this.processedEventStore = config.directMessageReplay?.store;
     this.relayConnections = new RelayConnectionManager(this.relays);
-    this.relayConnections.registerSubscription({ kinds: [1059], "#p": [this.pubkeyHex] }, (event) =>
-      this.handleGiftWrap(event),
+    this.relayConnections.registerSubscription(
+      {
+        kinds: [1059],
+        "#p": [this.pubkeyHex],
+        since: Math.max(0, this.directMessageCutoff - NIP59_GIFT_WRAP_BACKDATE_SECONDS),
+      },
+      (event) => this.handleGiftWrap(event),
     );
   }
 
@@ -127,6 +159,35 @@ export class NostrCommunityBot {
     return true;
   }
 
+  private isFreshDirectMessage(createdAt: number): boolean {
+    const now = Math.floor(Date.now() / 1_000);
+    const activeCutoff = Math.max(
+      this.directMessageCutoff,
+      now - this.directMessageOfflineGraceSeconds,
+    );
+    return createdAt >= activeCutoff && createdAt <= now + MAX_DM_FUTURE_SKEW_SECONDS;
+  }
+
+  private async persistEventAcceptance(eventId: string): Promise<boolean> {
+    if (!this.processedEventStore) {
+      return true;
+    }
+
+    const processed = await this.processedEventStore.isProcessed(eventId);
+    if (typeof processed !== "boolean") {
+      throw new Error("Processed event store returned an invalid result");
+    }
+    if (processed) {
+      return false;
+    }
+
+    const claimed = await this.processedEventStore.markProcessed(eventId);
+    if (claimed !== undefined && typeof claimed !== "boolean") {
+      throw new Error("Processed event store returned an invalid claim result");
+    }
+    return claimed !== false;
+  }
+
   private async handleGiftWrap(event: NostrEvent): Promise<void> {
     if (!this.acceptingRelayEvents) {
       return;
@@ -139,7 +200,15 @@ export class NostrCommunityBot {
       return;
     }
 
-    if (!this.acceptingRelayEvents || !this.rememberEvent(event.id)) {
+    if (
+      !this.acceptingRelayEvents ||
+      !this.isFreshDirectMessage(rumor.created_at) ||
+      !this.rememberEvent(rumor.id)
+    ) {
+      return;
+    }
+
+    if (!(await this.persistEventAcceptance(rumor.id)) || !this.acceptingRelayEvents) {
       return;
     }
 
