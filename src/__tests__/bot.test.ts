@@ -207,7 +207,8 @@ describe("NostrCommunityBot", () => {
 
   it("discards authenticated direct messages older than the configured offline window", async () => {
     relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
-    const now = Math.floor(Date.now() / 1_000);
+    const now = 1_800_000_000;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now * 1_000);
     const bot = new NostrCommunityBot({
       nsec: TEST_SECRET_HEX,
       relays: TEST_RELAYS,
@@ -222,6 +223,7 @@ describe("NostrCommunityBot", () => {
       createInboundMessageAt("/ping stale", bot.getPublicKeyHex(), now - 61),
     );
     await new Promise((resolve) => setTimeout(resolve, 10));
+    clock.mockRestore();
 
     expect(handler).not.toHaveBeenCalled();
   });
@@ -253,7 +255,8 @@ describe("NostrCommunityBot", () => {
 
   it("rejects authenticated rumors too far in the future", async () => {
     relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
-    const now = Math.floor(Date.now() / 1_000);
+    const now = 1_800_000_000;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now * 1_000);
     const bot = new NostrCommunityBot({ nsec: TEST_SECRET_HEX, relays: TEST_RELAYS });
     const handler = vi.fn();
     bot.registerCommand("ping", handler);
@@ -264,6 +267,7 @@ describe("NostrCommunityBot", () => {
       createInboundMessageAt("/ping future", bot.getPublicKeyHex(), now + 301),
     );
     await new Promise((resolve) => setTimeout(resolve, 10));
+    clock.mockRestore();
 
     expect(handler).not.toHaveBeenCalled();
   });
