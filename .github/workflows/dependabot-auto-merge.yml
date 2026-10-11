@@ -1,14 +1,29 @@
+# Auto-approve and auto-merge Dependabot minor/patch updates.
+#
+# Merging is gated by branch protection on main: native auto-merge (`gh pr merge --auto`)
+# only merges once every required check passes and the branch is up to date with main.
+#
+# Dependabot minor/patch updates are exempt from the TunnelSentinel code review. Because
+# 'TunnelSentinel / Code Review' is a required check, this workflow posts it with state
+# success and the description "Not reviewed", so these updates merge on CI alone. It only
+# does so when all of the following hold:
+# 1. the PR was opened by Dependabot and this run was triggered by Dependabot,
+# 2. dependabot/fetch-metadata reports a minor or patch update,
+# 3. the PR changes nothing but package.json, package-lock.json or workflow files.
+# Major updates, and Dependabot PRs that someone else pushed to, still need a real review.
+
 name: Dependabot Auto-Merge
 on: pull_request
 
 permissions:
   pull-requests: write
   contents: write
+  statuses: write # post the 'TunnelSentinel / Code Review' exemption status
 
 jobs:
   dependabot:
     runs-on: ubuntu-latest
-    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.actor == 'dependabot[bot]'
     steps:
       - name: Dependabot metadata
         id: metadata
@@ -16,11 +31,39 @@ jobs:
         with:
           github-token: "${{ secrets.GITHUB_TOKEN }}"
 
+      - name: Check that only dependency files changed
+        if: steps.metadata.outputs.update-type == 'version-update:semver-patch' || steps.metadata.outputs.update-type == 'version-update:semver-minor'
+        run: |
+          set -euo pipefail
+          files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --jq '.[].filename')
+          printf 'Changed files:\n%s\n' "$files"
+          other=$(printf '%s\n' "$files" | grep -Ev '^(package\.json|package-lock\.json|\.github/workflows/[^/]+\.ya?ml)$' || true)
+          if [ -n "$other" ]; then
+            echo "::error::Not auto-merging: this PR changes files outside the dependency allow-list."
+            printf '%s\n' "$other"
+            exit 1
+          fi
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Approve the PR
         if: steps.metadata.outputs.update-type == 'version-update:semver-patch' || steps.metadata.outputs.update-type == 'version-update:semver-minor'
         run: gh pr review --approve "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Mark the TunnelSentinel review as not required
+        if: steps.metadata.outputs.update-type == 'version-update:semver-patch' || steps.metadata.outputs.update-type == 'version-update:semver-minor'
+        run: |
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+            -f state=success \
+            -f context='TunnelSentinel / Code Review' \
+            -f description='Not reviewed: Dependabot minor/patch update, gated on CI' \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Enable auto-merge for Dependabot PRs

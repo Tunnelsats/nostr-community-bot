@@ -23,6 +23,11 @@ Please maintain a respectful, collaborative, and security-minded environment for
 4. Ensure `npm audit` reports **zero vulnerabilities**.
 5. Submit your PR against the `main` branch with a descriptive summary.
 
+### 3. Dependency Updates
+- Dependabot opens one weekly PR with all npm minor and patch updates, and separate PRs for major updates and GitHub Actions updates.
+- Dependabot minor and patch updates are approved and auto-merged by [`dependabot-auto-merge.yml`](.github/workflows/dependabot-auto-merge.yml) once CI passes. They are exempt from the TunnelSentinel code review: the workflow marks the required `TunnelSentinel / Code Review` check as "Not reviewed", but only when the PR changes nothing except `package.json`, `package-lock.json` or workflow files.
+- Major updates are reviewed and merged by a maintainer.
+
 ---
 
 ## Coding Guidelines
