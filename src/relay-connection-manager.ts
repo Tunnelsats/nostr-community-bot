@@ -1,12 +1,39 @@
 import WebSocket from "ws";
+import { isIP } from "node:net";
 import { SimplePool, useWebSocketImplementation } from "nostr-tools/pool";
 import type { Filter, NostrEvent } from "nostr-tools";
+import {
+  createPublicLookup,
+  isPublicIpAddress,
+  resolveHostname,
+  type HostnameResolver,
+} from "./dm-relays.js";
 import type { RelayConnectionStatus } from "./types.js";
 
 const CONNECTION_TIMEOUT_MS = 3_000;
+const PUBLICATION_TIMEOUT_MS = 5_000;
+const MAX_QUERY_EVENTS_PER_RELAY = 32;
 const INITIAL_RECONNECT_DELAY_MS = 1_000;
 const MAX_RECONNECT_DELAY_MS = 30_000;
 const RELAY_PUBLICATION_FAILED = "Relay publication failed";
+const RELAY_QUERY_FAILED = "Relay query failed";
+const MAX_WEBSOCKET_PAYLOAD_BYTES = 1024 * 1024;
+export const MAX_PERSISTENT_RELAY_COUNT = 32;
+
+function validatePublicRelayAddress(address: string | URL): string | URL {
+  const url = address instanceof URL ? address : new URL(address);
+  const hostname = url.hostname.replace(/^\[|\]$/g, "");
+  if (
+    url.protocol !== "wss:" ||
+    url.username.length > 0 ||
+    url.password.length > 0 ||
+    url.hash.length > 0 ||
+    (isIP(hostname) !== 0 && !isPublicIpAddress(hostname))
+  ) {
+    throw new Error("Relay URL must target a public IP address over wss");
+  }
+  return address;
+}
 
 export interface RelaySubscriptionLike {
   close(reason?: string): void;
@@ -16,7 +43,7 @@ export interface RelayLike {
   onclose: (() => void) | null;
   subscribe(
     filters: Filter[],
-    params: { onevent?: (event: NostrEvent) => void },
+    params: { onevent?: (event: NostrEvent) => void; oneose?: () => void },
   ): RelaySubscriptionLike;
   publish(event: NostrEvent): Promise<string>;
 }
@@ -39,8 +66,24 @@ interface SubscriptionRegistration {
   handler: RelayEventHandler;
 }
 
-function createRelayPool(): RelayPoolLike {
-  useWebSocketImplementation(WebSocket);
+export function createPublicWebSocketImplementation(
+  resolver: HostnameResolver = resolveHostname,
+  BaseWebSocket: typeof WebSocket = WebSocket,
+): typeof WebSocket {
+  class PublicRelayWebSocket extends BaseWebSocket {
+    public constructor(address: string | URL, protocols?: string | string[]) {
+      super(validatePublicRelayAddress(address), protocols, {
+        followRedirects: false,
+        lookup: createPublicLookup(resolver),
+        maxPayload: MAX_WEBSOCKET_PAYLOAD_BYTES,
+      });
+    }
+  }
+  return PublicRelayWebSocket as typeof WebSocket;
+}
+
+function createRelayPool(resolver: HostnameResolver): RelayPoolLike {
+  useWebSocketImplementation(createPublicWebSocketImplementation(resolver));
   return new SimplePool({ enablePing: true, enableReconnect: false });
 }
 
@@ -55,6 +98,7 @@ export class RelayConnectionManager {
   private readonly subscriptionRegistrations = new Map<number, SubscriptionRegistration>();
   private readonly liveSubscriptions = new Map<string, Map<number, RelaySubscriptionLike>>();
   private readonly pendingTasks = new Set<Promise<unknown>>();
+  private readonly temporaryRelayReferences = new Map<string, number>();
   private pool: RelayPoolLike | null = null;
   private active = false;
   private generation = 0;
@@ -62,9 +106,13 @@ export class RelayConnectionManager {
   private stopPromise: Promise<void> | null = null;
   private nextSubscriptionId = 1;
 
-  public constructor(relays: string[], poolFactory: RelayPoolFactory = createRelayPool) {
+  public constructor(
+    relays: string[],
+    poolFactory?: RelayPoolFactory,
+    hostnameResolver: HostnameResolver = resolveHostname,
+  ) {
     this.relays = [...new Set(relays)];
-    this.poolFactory = poolFactory;
+    this.poolFactory = poolFactory ?? (() => createRelayPool(hostnameResolver));
 
     for (const url of this.relays) {
       this.statuses.set(url, { url, state: "disconnected", reconnectAttempts: 0 });
@@ -110,6 +158,44 @@ export class RelayConnectionManager {
     }
 
     return this.trackTask(this.publishToActiveRelays(event));
+  }
+
+  public query(filter: Filter, timeoutMs = CONNECTION_TIMEOUT_MS): Promise<NostrEvent[]> {
+    if (!this.active) {
+      return Promise.reject(new Error(RELAY_QUERY_FAILED));
+    }
+
+    return this.trackTask(this.queryActiveRelays(filter, timeoutMs));
+  }
+
+  public publishToRelays(event: NostrEvent, relayUrls: string[]): Promise<void> {
+    if (!this.active || relayUrls.length === 0) {
+      return Promise.reject(new Error(RELAY_PUBLICATION_FAILED));
+    }
+
+    return this.trackTask(this.publishToRelayUrls(event, [...new Set(relayUrls)]));
+  }
+
+  public async addRelays(relayUrls: string[]): Promise<void> {
+    const validated = [...new Set(relayUrls)].map((url) => {
+      validatePublicRelayAddress(url);
+      return url;
+    });
+    const additions = validated.filter((url) => !this.relays.includes(url));
+    if (this.relays.length + additions.length > MAX_PERSISTENT_RELAY_COUNT) {
+      throw new Error("Persistent relay limit exceeded");
+    }
+    for (const url of additions) {
+      this.relays.push(url);
+      this.statuses.set(url, {
+        url,
+        state: this.active ? "connecting" : "disconnected",
+        reconnectAttempts: 0,
+      });
+    }
+    if (!this.active || additions.length === 0) return;
+    const generation = this.generation;
+    await Promise.allSettled(additions.map((url) => this.connectRelay(url, generation)));
   }
 
   public start(): Promise<void> {
@@ -342,6 +428,141 @@ export class RelayConnectionManager {
     }
   }
 
+  private async queryActiveRelays(filter: Filter, timeoutMs: number): Promise<NostrEvent[]> {
+    const relays = [...this.activeRelays.values()];
+    if (relays.length === 0) {
+      throw new Error(RELAY_QUERY_FAILED);
+    }
+
+    const results = await Promise.all(
+      relays.map(
+        (relay) =>
+          new Promise<NostrEvent[]>((resolve) => {
+            const events: NostrEvent[] = [];
+            let settled = false;
+            let subscription: RelaySubscriptionLike | null = null;
+            const finish = () => {
+              if (settled) return;
+              settled = true;
+              clearTimeout(timeout);
+              try {
+                subscription?.close("query complete");
+              } catch {
+                // Query results remain usable when local cleanup fails.
+              }
+              resolve(events);
+            };
+            const timeout = setTimeout(finish, timeoutMs);
+            timeout.unref?.();
+            try {
+              subscription = relay.subscribe([filter], {
+                onevent: (event) => {
+                  if (events.length < MAX_QUERY_EVENTS_PER_RELAY) events.push(event);
+                },
+                oneose: finish,
+              });
+              if (settled) {
+                subscription.close("query complete");
+              }
+            } catch {
+              finish();
+            }
+          }),
+      ),
+    );
+
+    const unique = new Map<string, NostrEvent>();
+    for (const event of results.flat()) unique.set(event.id, event);
+    return [...unique.values()];
+  }
+
+  private async publishToRelayUrls(event: NostrEvent, relayUrls: string[]): Promise<void> {
+    const pool = this.pool;
+    if (!pool) throw new Error(RELAY_PUBLICATION_FAILED);
+
+    const results = await Promise.allSettled(
+      relayUrls.map(async (url) => {
+        const existing = this.findActiveRelay(url);
+        if (existing) return this.publishWithTimeout(existing, event);
+
+        this.retainTemporaryRelay(url);
+        try {
+          const relay = await pool.ensureRelay(url, {
+            connectionTimeout: CONNECTION_TIMEOUT_MS,
+          });
+          return await this.publishWithTimeout(relay, event);
+        } finally {
+          this.releaseTemporaryRelay(url, pool);
+        }
+      }),
+    );
+    if (!results.some((result) => result.status === "fulfilled")) {
+      throw new Error(RELAY_PUBLICATION_FAILED);
+    }
+  }
+
+  private findActiveRelay(url: string): RelayLike | undefined {
+    const exact = this.activeRelays.get(url);
+    if (exact) return exact;
+
+    let canonicalTarget: string;
+    try {
+      canonicalTarget = new URL(url).toString();
+    } catch {
+      return undefined;
+    }
+    for (const [activeUrl, relay] of this.activeRelays) {
+      try {
+        if (new URL(activeUrl).toString() === canonicalTarget) return relay;
+      } catch {
+        // Configured relay validation belongs to the caller; skip malformed keys here.
+      }
+    }
+    return undefined;
+  }
+
+  private retainTemporaryRelay(url: string): void {
+    this.temporaryRelayReferences.set(
+      url,
+      (this.temporaryRelayReferences.get(url) ?? 0) + 1,
+    );
+  }
+
+  private releaseTemporaryRelay(url: string, pool: RelayPoolLike): void {
+    const remaining = (this.temporaryRelayReferences.get(url) ?? 1) - 1;
+    if (remaining > 0) {
+      this.temporaryRelayReferences.set(url, remaining);
+      return;
+    }
+    this.temporaryRelayReferences.delete(url);
+    try {
+      pool.close([url]);
+    } catch {
+      // Retain the URL so a later publication or stop() retries local cleanup.
+      this.temporaryRelayReferences.set(url, 0);
+    }
+  }
+
+  private publishWithTimeout(relay: RelayLike, event: NostrEvent): Promise<string> {
+    return new Promise<string>((resolve, reject) => {
+      const timeout = setTimeout(
+        () => reject(new Error(RELAY_PUBLICATION_FAILED)),
+        PUBLICATION_TIMEOUT_MS,
+      );
+      timeout.unref?.();
+      void relay.publish(event).then(
+        (result) => {
+          clearTimeout(timeout);
+          resolve(result);
+        },
+        () => {
+          clearTimeout(timeout);
+          reject(new Error(RELAY_PUBLICATION_FAILED));
+        },
+      );
+    });
+  }
+
   private trackTask<T>(task: Promise<T>): Promise<T> {
     this.pendingTasks.add(task);
     const clearTask = () => {
@@ -364,26 +585,30 @@ export class RelayConnectionManager {
     const pool = this.pool;
     const startPromise = this.startPromise;
     const connectionPromises = [...this.connectionPromises.values()];
-    const pendingTasks = [...this.pendingTasks];
     let closeError: unknown;
-    try {
-      pool?.close(this.relays);
-    } catch (error) {
-      closeError = error;
-    }
     for (const controller of this.connectionControllers.values()) {
       controller.abort();
     }
     await Promise.allSettled([
       ...connectionPromises,
-      ...pendingTasks,
       ...(startPromise ? [startPromise] : []),
     ]);
+    while (this.pendingTasks.size > 0) {
+      await Promise.allSettled([...this.pendingTasks]);
+    }
+    try {
+      pool?.close([
+        ...new Set([...this.relays, ...this.temporaryRelayReferences.keys()]),
+      ]);
+    } catch (error) {
+      closeError = error;
+    }
 
     this.activeRelays.clear();
     this.connectionControllers.clear();
     this.connectionPromises.clear();
     this.pendingTasks.clear();
+    this.temporaryRelayReferences.clear();
     this.pool = null;
     this.startPromise = null;
     for (const url of this.relays) {
