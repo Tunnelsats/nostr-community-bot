@@ -123,6 +123,8 @@ export interface CommandContext {
   command: string;
   /** Command arguments array */
   args: string[];
+  /** Raw command message text preserving original newlines and whitespace */
+  rawText?: string;
   /** Sender public key in hex format */
   senderPubkey: string;
   /** Event ID of the triggering message */

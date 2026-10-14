@@ -229,6 +229,9 @@ export class ConcordCommunityManager {
       await this.relayTransport.addRelays(bundle.relays);
       if (!this.accepting) return;
       const state = this.registerCommunityState(bundle, persisted.joinPublished);
+      console.log(
+        `[Concord] Restored community ${bundle.community_id.slice(0, 8)}... from store across ${bundle.relays.length} relay(s)`,
+      );
       if (!state.joinPublished) {
         await this.publishJoin(bundle);
         state.joinPublished = true;
