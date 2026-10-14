@@ -22,6 +22,7 @@ export function parseSecretKey(nsecOrHex: string): Uint8Array {
 
 /**
  * Parses raw text input into a command name and arguments array.
+ * Supports unquoted tokens and Armada BotCommandComposer shell-quoted spans ("..." with \" and \\ escaping).
  * Example: "/ping 03864e..." -> { command: "ping", args: ["03864e..."] }
  */
 export function parseCommand(text: string): { command: string; args: string[] } | null {
@@ -30,12 +31,64 @@ export function parseCommand(text: string): { command: string; args: string[] } 
     return null;
   }
 
-  const parts = trimmed.slice(1).split(/\s+/);
-  const command = parts[0].toLowerCase();
-  const args = parts.slice(1);
+  const body = trimmed.slice(1);
+  if (!body || body.startsWith('"') || /^\s/.test(body)) {
+    return null;
+  }
 
+  const firstSpaceMatch = body.match(/\s/);
+  const commandRaw = firstSpaceMatch ? body.slice(0, firstSpaceMatch.index) : body;
+  const command = commandRaw.toLowerCase();
   if (!command) {
     return null;
+  }
+
+  const rest = firstSpaceMatch ? body.slice((firstSpaceMatch.index ?? 0) + 1) : "";
+  const args: string[] = [];
+  let i = 0;
+
+  while (i < rest.length) {
+    while (i < rest.length && /\s/.test(rest[i])) {
+      i++;
+    }
+    if (i >= rest.length) {
+      break;
+    }
+
+    if (rest[i] === '"') {
+      let cursor = i + 1;
+      let value = "";
+      let closed = false;
+      while (cursor < rest.length) {
+        if (
+          rest[cursor] === "\\" &&
+          cursor + 1 < rest.length &&
+          (rest[cursor + 1] === '"' || rest[cursor + 1] === "\\")
+        ) {
+          value += rest[cursor + 1];
+          cursor += 2;
+        } else if (rest[cursor] === '"') {
+          closed = true;
+          cursor++;
+          break;
+        } else {
+          value += rest[cursor];
+          cursor++;
+        }
+      }
+
+      if (closed && (cursor >= rest.length || /\s/.test(rest[cursor]))) {
+        args.push(value);
+        i = cursor;
+        continue;
+      }
+    }
+
+    const start = i;
+    while (i < rest.length && !/\s/.test(rest[i])) {
+      i++;
+    }
+    args.push(rest.slice(start, i));
   }
 
   return { command, args };

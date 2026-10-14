@@ -1226,4 +1226,204 @@ describe("NostrCommunityBot", () => {
       }),
     );
   });
+
+  it("parses shell-quoted arguments emitted by Armada BotCommandComposer", async () => {
+    const bot = new NostrCommunityBot({ nsec: TEST_SECRET_HEX, relays: TEST_RELAYS });
+    const handler = vi.fn();
+    bot.registerCommand("faq", handler);
+
+    await bot.processMessage('/faq "1" "with \\"escaped\\" quotes"', SENDER_PUBKEY, "event-quoted");
+
+    expect(handler).toHaveBeenCalledWith(
+      expect.objectContaining({
+        command: "faq",
+        args: ["1", 'with "escaped" quotes'],
+      }),
+    );
+  });
+
+  it("builds and publishes a validated Kind 10304 Bot Command Manifest while honoring includeInManifest", async () => {
+    relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
+    const bot = new NostrCommunityBot({ nsec: TEST_SECRET_HEX, relays: TEST_RELAYS });
+    bot
+      .registerCommand("ping", () => undefined, {
+        description: "Ping a Lightning node over clearnet",
+        args: [
+          {
+            name: "pubkey",
+            type: "string",
+            description: "66-char compressed secp256k1 node pubkey",
+            required: true,
+          },
+        ],
+      })
+      .registerCommand("faq", () => undefined, {
+        description: "Show TunnelSats FAQ topics",
+        args: [
+          {
+            name: "topic",
+            type: "choice",
+            description: "FAQ topic number (1-11)",
+            required: false,
+            choices: ["1", "2", "3"],
+          },
+        ],
+      })
+      .registerCommand("setwelcome", () => undefined, {
+        description: "Update welcome template",
+        includeInManifest: false,
+      });
+
+    expect(bot.getCommandManifest()).toEqual({
+      v: 1,
+      commands: [
+        {
+          name: "ping",
+          description: "Ping a Lightning node over clearnet",
+          args: [
+            {
+              name: "pubkey",
+              type: "string",
+              description: "66-char compressed secp256k1 node pubkey",
+              required: true,
+              choices: [],
+            },
+          ],
+        },
+        {
+          name: "faq",
+          description: "Show TunnelSats FAQ topics",
+          args: [
+            {
+              name: "topic",
+              type: "choice",
+              description: "FAQ topic number (1-11)",
+              required: false,
+              choices: ["1", "2", "3"],
+            },
+          ],
+        },
+      ],
+    });
+
+    await bot.start();
+    const published = await bot.publishBotManifest();
+    expect(published).toBe(true);
+    expect(relayPoolMocks.publish).toHaveBeenCalledTimes(TEST_RELAYS.length);
+    const manifestEvent = relayPoolMocks.publish.mock.calls[0][0] as NostrEvent;
+    expect(manifestEvent.kind).toBe(10304);
+    expect(manifestEvent.pubkey).toBe(bot.getPublicKeyHex());
+    expect(JSON.parse(manifestEvent.content)).toEqual(bot.getCommandManifest());
+  });
+
+  it("validates Armada Kind 10304 manifest constraints on command registration", () => {
+    const bot = new NostrCommunityBot({ nsec: TEST_SECRET_HEX, relays: TEST_RELAYS });
+
+    expect(() =>
+      bot.registerCommand("badorder", () => undefined, {
+        description: "Optional before required",
+        args: [
+          { name: "opt", type: "string", required: false },
+          { name: "req", type: "string", required: true },
+        ],
+      }),
+    ).toThrow(/Required arguments must precede optional arguments/);
+
+    expect(() =>
+      bot.registerCommand("badchoice", () => undefined, {
+        description: "Choice without choices",
+        args: [{ name: "topic", type: "choice" }],
+      }),
+    ).toThrow(/must define 1\.\.32 choices/);
+
+    expect(() =>
+      bot.registerCommand("nonchoice", () => undefined, {
+        description: "String with choices",
+        args: [{ name: "topic", type: "string", choices: ["a"] }],
+      }),
+    ).toThrow(/cannot define choices/);
+  });
+
+  it("non-destructively merges bot: true into existing Kind 0 profile metadata and fails closed when missing", async () => {
+    const existingMetadata = {
+      display_name: "TunnelSats",
+      name: "TunnelSats",
+      picture: "https://example.com/pic.png",
+      banner: "https://example.com/banner.jpg",
+      about: "Lightning Hybrid Mode",
+      lud06: "lnurl1example",
+      lud16: "info@ln.tunnelsats.com",
+      website: "https://tunnelsats.com",
+      nip05: "tunnelsats@tunnelsats.com",
+    };
+    const existingKind0 = finalizeEvent(
+      {
+        kind: 0,
+        created_at: 1_767_885_809,
+        tags: [["client", "test"]],
+        content: JSON.stringify(existingMetadata),
+      },
+      BOT_SECRET,
+    );
+
+    relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
+    relayPoolMocks.subscribe.mockImplementation((filters, params) => {
+      if (filters[0]?.kinds?.includes(0)) {
+        queueMicrotask(() => {
+          params.onevent?.(existingKind0);
+          params.oneose?.();
+        });
+      }
+      return { close: vi.fn() };
+    });
+
+    const bot = new NostrCommunityBot({
+      nsec: TEST_SECRET_HEX,
+      relays: TEST_RELAYS,
+      botManifest: { enabled: true, publishBotProfileFlag: true },
+    });
+    bot.registerCommand("help", () => undefined, {
+      description: "Show available commands",
+    });
+
+    await bot.start();
+
+    const publishedEvents = relayPoolMocks.publish.mock.calls.map(
+      (call) => call[0] as NostrEvent,
+    );
+    const kind0Event = publishedEvents.find((event) => event.kind === 0);
+    const kind10304Event = publishedEvents.find((event) => event.kind === 10304);
+
+    expect(kind0Event).toBeDefined();
+    expect(kind0Event?.tags).toEqual([["client", "test"]]);
+    expect(kind0Event?.created_at).toBeGreaterThan(existingKind0.created_at);
+    expect(JSON.parse(kind0Event!.content)).toEqual({
+      ...existingMetadata,
+      bot: true,
+    });
+    expect(kind10304Event).toBeDefined();
+  });
+
+  it("refuses to publish a blank Kind 0 profile when no existing Kind 0 is found on relays", async () => {
+    relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
+    relayPoolMocks.subscribe.mockImplementation((filters, params) => {
+      if (filters[0]?.kinds?.includes(0)) {
+        queueMicrotask(() => {
+          params.oneose?.();
+        });
+      }
+      return { close: vi.fn() };
+    });
+
+    const bot = new NostrCommunityBot({
+      nsec: TEST_SECRET_HEX,
+      relays: TEST_RELAYS,
+    });
+    await bot.start();
+
+    const updated = await bot.ensureBotProfileFlag();
+    expect(updated).toBe(false);
+    expect(relayPoolMocks.publish).not.toHaveBeenCalled();
+  });
 });
+
