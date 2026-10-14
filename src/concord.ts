@@ -114,10 +114,13 @@ export interface ConcordChannelDefinition {
   deleted: boolean;
 }
 
+export type ConcordRoleType = "owner" | "admin" | "moderator" | "member";
+
 export interface FoldedConcordControl {
   channels: ConcordChannelDefinition[];
   canManageMessages(actor: string, target: string, channelId: string): boolean;
   canManageChannelOrMessages(actor: string, channelId: string): boolean;
+  roleFor(actor: string, channelId?: string): ConcordRoleType;
   roleIdsFor(member: string): string[];
 }
 
@@ -827,6 +830,29 @@ export function foldConcordControl(
     if (selected) channels.push(selected);
   }
 
+  const roleFor = (actor: string, channelId = ""): ConcordRoleType => {
+    if (actor === material.owner) return "owner";
+    let hasModerator = false;
+    for (const roleId of grants.get(actor) ?? []) {
+      const role = roles.get(roleId);
+      if (!role || role.deleted || !applicable(role, channelId)) continue;
+      const trimmedName = role.name.trim();
+      if (
+        /^admin(?:istrator)?s?$/i.test(trimmedName) ||
+        (role.permissions & (CONCORD_MANAGE_ROLES | CONCORD_MANAGE_CHANNELS)) !== 0n
+      ) {
+        return "admin";
+      }
+      if (
+        /^mod(?:erator)?s?$/i.test(trimmedName) ||
+        (role.permissions & CONCORD_MANAGE_MESSAGES) !== 0n
+      ) {
+        hasModerator = true;
+      }
+    }
+    return hasModerator ? "moderator" : "member";
+  };
+
   return {
     channels,
     canManageMessages(actor, target, channelId) {
@@ -839,12 +865,10 @@ export function foldConcordControl(
       );
     },
     canManageChannelOrMessages(actor, channelId) {
-      const actorStanding = standing(actor, channelId);
-      return (
-        actorStanding.isOwner ||
-        (actorStanding.permissions & (CONCORD_MANAGE_MESSAGES | CONCORD_MANAGE_CHANNELS)) !== 0n
-      );
+      const role = roleFor(actor, channelId);
+      return role === "owner" || role === "admin" || role === "moderator";
     },
+    roleFor,
     roleIdsFor(member) {
       return [...(grants.get(member) ?? [])];
     },

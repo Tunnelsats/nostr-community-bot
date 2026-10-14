@@ -134,6 +134,8 @@ await bot.start();
 await bot.publishConcordChannelMessage("default", "general", "Scheduled status update");
 ```
 
+When Concord is enabled, both channel commands and NIP-17 DM commands receive `ctx.senderRole` (`"owner" | "admin" | "moderator" | "member"`) and `ctx.isModerator` resolved from the folded `kind:3308` control stream (for DMs, resolved against the community's target channel such as `defaultChannelId`).
+
 ### Proactive NIP-17 Direct Messages
 
 `bot.sendDirectMessage(recipientPubkey, message)` queries `kind:10050` DM relay lists for both the bot and the recipient, validates that every relay URL resolves exclusively to public IPv4/IPv6 addresses over `wss:`, and publishes sender and recipient NIP-17 gift wraps. Keep the bot `nsec` in a secret store or `.env` file: never log it, pass it through a command context, or commit it to source control.

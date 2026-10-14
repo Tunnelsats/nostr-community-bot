@@ -405,6 +405,7 @@ describe("ConcordCommunityManager", () => {
         channelId: PRIVATE_CHANNEL,
         channelName: "private",
         isModerator: false,
+        senderRole: "member",
       },
     );
     expect(currentHarness.published).toHaveLength(1);
@@ -562,6 +563,7 @@ describe("ConcordCommunityManager", () => {
         senderNpub: nip19.npubEncode(MEMBER),
         content: "Hey @TunnelSats how do I get started?",
         isModerator: true,
+        senderRole: "moderator",
       }),
     );
     expect(currentHarness.published).toHaveLength(1);
@@ -828,5 +830,142 @@ describe("ConcordCommunityManager", () => {
       }),
     );
     expect(currentHarness.processMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("resolves getMemberRole and dispatches senderRole for owner, admin, moderator, and member", async () => {
+    const adminSecret = generateSecretKey();
+    const adminPubkey = getPublicKey(adminSecret);
+    const modSecret = generateSecretKey();
+    const modPubkey = getPublicKey(modSecret);
+
+    await currentHarness.manager.acceptDirectInvite(directInviteRumor());
+
+    const controlRead = deriveConcordGroupKey(
+      "concord/control",
+      Buffer.from(ROOT, "hex"),
+      Buffer.from(COMMUNITY_ID, "hex"),
+      2,
+    );
+    const controlGroup = {
+      ...controlRead,
+      secretKey: CONTROL_SIGNER_SECRET,
+      publicKey: CONTROL_PK,
+    };
+    const adminRoleId = "81".repeat(32);
+    const modRoleId = "82".repeat(32);
+    const controlSub = findSubscription(CONTROL_PK);
+
+    await controlSub.handler(
+      createConcordStreamEvent(
+        OWNER_SECRET,
+        controlGroup,
+        {
+          kind: CONCORD_CONTROL_KIND,
+          content: JSON.stringify({
+            role_id: adminRoleId,
+            name: "Admin",
+            position: 1,
+            permissions: "0",
+            scope: { kind: "server" },
+          }),
+          tags: [["vsk", "1"], ["eid", adminRoleId], ["ev", "1"]],
+          created_at: 1_700_000_000,
+        },
+        { sealKind: 20014 },
+      ),
+    );
+    await controlSub.handler(
+      createConcordStreamEvent(
+        OWNER_SECRET,
+        controlGroup,
+        {
+          kind: CONCORD_CONTROL_KIND,
+          content: JSON.stringify({
+            role_id: modRoleId,
+            name: "Moderator",
+            position: 2,
+            permissions: String(CONCORD_MANAGE_MESSAGES),
+            scope: { kind: "channel", channel_id: PRIVATE_CHANNEL },
+          }),
+          tags: [["vsk", "1"], ["eid", modRoleId], ["ev", "1"]],
+          created_at: 1_700_000_001,
+        },
+        { sealKind: 20014 },
+      ),
+    );
+    await controlSub.handler(
+      createConcordStreamEvent(
+        OWNER_SECRET,
+        controlGroup,
+        {
+          kind: CONCORD_CONTROL_KIND,
+          content: JSON.stringify({ member: adminPubkey, role_ids: [adminRoleId] }),
+          tags: [
+            ["vsk", "3"],
+            ["eid", computeConcordGrantLocator(COMMUNITY_ID, adminPubkey)],
+            ["ev", "1"],
+          ],
+          created_at: 1_700_000_002,
+        },
+        { sealKind: 20014 },
+      ),
+    );
+    await controlSub.handler(
+      createConcordStreamEvent(
+        OWNER_SECRET,
+        controlGroup,
+        {
+          kind: CONCORD_CONTROL_KIND,
+          content: JSON.stringify({ member: modPubkey, role_ids: [modRoleId] }),
+          tags: [
+            ["vsk", "3"],
+            ["eid", computeConcordGrantLocator(COMMUNITY_ID, modPubkey)],
+            ["ev", "1"],
+          ],
+          created_at: 1_700_000_003,
+        },
+        { sealKind: 20014 },
+      ),
+    );
+
+    expect(currentHarness.manager.getMemberRole(OWNER)).toBe("owner");
+    expect(currentHarness.manager.getMemberRole(adminPubkey)).toBe("admin");
+    expect(currentHarness.manager.getMemberRole(modPubkey)).toBe("moderator");
+    expect(currentHarness.manager.getMemberRole(MEMBER)).toBe("member");
+
+    const group = deriveConcordGroupKey(
+      "concord/channel",
+      Buffer.from(PRIVATE_KEY, "hex"),
+      Buffer.from(PRIVATE_CHANNEL, "hex"),
+      4,
+    );
+    const channelSub = findSubscription(group.publicKey);
+
+    for (const [secret, expectedRole, expectedMod] of [
+      [OWNER_SECRET, "owner", true],
+      [adminSecret, "admin", true],
+      [modSecret, "moderator", true],
+      [MEMBER_SECRET, "member", false],
+    ] as const) {
+      currentHarness.processMessage.mockClear();
+      await channelSub.handler(
+        createConcordStreamEvent(secret, group, {
+          kind: 9,
+          content: "/setwelcome Welcome!",
+          tags: [["channel", PRIVATE_CHANNEL], ["epoch", "4"]],
+          created_at: 1_700_000_010,
+        }),
+      );
+      expect(currentHarness.processMessage).toHaveBeenCalledWith(
+        "/setwelcome Welcome!",
+        getPublicKey(secret),
+        expect.any(String),
+        expect.any(Function),
+        expect.objectContaining({
+          senderRole: expectedRole,
+          isModerator: expectedMod,
+        }),
+      );
+    }
   });
 });

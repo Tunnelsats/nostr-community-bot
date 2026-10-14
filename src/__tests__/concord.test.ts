@@ -3,6 +3,7 @@ import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools/pure
 import {
   CONCORD_MANAGE_CHANNELS,
   CONCORD_MANAGE_MESSAGES,
+  CONCORD_MANAGE_ROLES,
   computeConcordCommunityId,
   computeConcordEditionHash,
   computeConcordGrantLocator,
@@ -383,6 +384,112 @@ describe("Concord moderator authority", () => {
     );
 
     expect(state.canManageMessages(BOT, MEMBER, CHANNEL_ID)).toBe(false);
+  });
+
+  it("resolves owner, admin, moderator, and member roles by permissions and role names", () => {
+    const adminByPermMember = getPublicKey(generateSecretKey());
+    const adminByNameMember = getPublicKey(generateSecretKey());
+    const modByPermMember = getPublicKey(generateSecretKey());
+    const modByNameMember = getPublicKey(generateSecretKey());
+    const channelModMember = getPublicKey(generateSecretKey());
+    const plainMember = getPublicKey(generateSecretKey());
+
+    const adminPermRole = "51".repeat(32);
+    const adminNameRole = "52".repeat(32);
+    const modPermRole = "53".repeat(32);
+    const modNameRole = "54".repeat(32);
+    const channelModRole = "55".repeat(32);
+    const memberRole = "56".repeat(32);
+
+    const state = foldConcordControl(
+      [
+        edition(OWNER, 1, adminPermRole, {
+          role_id: adminPermRole,
+          name: "Staff",
+          position: 1,
+          permissions: String(CONCORD_MANAGE_ROLES),
+          scope: { kind: "server" },
+        }),
+        edition(OWNER, 1, adminNameRole, {
+          role_id: adminNameRole,
+          name: " Admin ",
+          position: 2,
+          permissions: "0",
+          scope: { kind: "server" },
+        }),
+        edition(OWNER, 1, modPermRole, {
+          role_id: modPermRole,
+          name: "Keeper",
+          position: 3,
+          permissions: String(CONCORD_MANAGE_MESSAGES),
+          scope: { kind: "server" },
+        }),
+        edition(OWNER, 1, modNameRole, {
+          role_id: modNameRole,
+          name: "Mod",
+          position: 4,
+          permissions: "0",
+          scope: { kind: "server" },
+        }),
+        edition(OWNER, 1, channelModRole, {
+          role_id: channelModRole,
+          name: "Moderator",
+          position: 5,
+          permissions: "0",
+          scope: { kind: "channel", channel_id: CHANNEL_ID },
+        }),
+        edition(OWNER, 1, memberRole, {
+          role_id: memberRole,
+          name: "Subscriber",
+          position: 10,
+          permissions: "0",
+          scope: { kind: "server" },
+        }),
+        edition(OWNER, 3, grantCoordinate(adminByPermMember), {
+          member: adminByPermMember,
+          role_ids: [modNameRole, adminPermRole],
+        }),
+        edition(OWNER, 3, grantCoordinate(adminByNameMember), {
+          member: adminByNameMember,
+          role_ids: [adminNameRole],
+        }),
+        edition(OWNER, 3, grantCoordinate(modByPermMember), {
+          member: modByPermMember,
+          role_ids: [modPermRole],
+        }),
+        edition(OWNER, 3, grantCoordinate(modByNameMember), {
+          member: modByNameMember,
+          role_ids: [modNameRole],
+        }),
+        edition(OWNER, 3, grantCoordinate(channelModMember), {
+          member: channelModMember,
+          role_ids: [channelModRole],
+        }),
+        edition(OWNER, 3, grantCoordinate(plainMember), {
+          member: plainMember,
+          role_ids: [memberRole],
+        }),
+      ],
+      { communityId: invite().community_id, owner: OWNER },
+    );
+
+    expect(state.roleFor(OWNER)).toBe("owner");
+    expect(state.roleFor(OWNER, CHANNEL_ID)).toBe("owner");
+    expect(state.roleFor(adminByPermMember, CHANNEL_ID)).toBe("admin");
+    expect(state.roleFor(adminByNameMember, CHANNEL_ID)).toBe("admin");
+    expect(state.roleFor(modByPermMember, CHANNEL_ID)).toBe("moderator");
+    expect(state.roleFor(modByNameMember, CHANNEL_ID)).toBe("moderator");
+    expect(state.roleFor(channelModMember, CHANNEL_ID)).toBe("moderator");
+    expect(state.roleFor(channelModMember, "99".repeat(32))).toBe("member");
+    expect(state.roleFor(channelModMember)).toBe("member");
+    expect(state.roleFor(plainMember, CHANNEL_ID)).toBe("member");
+    expect(state.roleFor(MEMBER, CHANNEL_ID)).toBe("member");
+
+    expect(state.canManageChannelOrMessages(adminByNameMember, CHANNEL_ID)).toBe(true);
+    expect(state.canManageChannelOrMessages(modByNameMember, CHANNEL_ID)).toBe(true);
+    expect(state.canManageChannelOrMessages(channelModMember, CHANNEL_ID)).toBe(true);
+    expect(state.canManageChannelOrMessages(channelModMember, "99".repeat(32))).toBe(false);
+    expect(state.canManageChannelOrMessages(plainMember, CHANNEL_ID)).toBe(false);
   });
 });
 

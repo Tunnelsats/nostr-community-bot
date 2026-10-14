@@ -21,6 +21,7 @@ import {
   type ConcordControlEdition,
   type ConcordGroupKey,
   type ConcordInviteBundle,
+  type ConcordRoleType,
   type ConcordRumor,
   type FoldedConcordControl,
 } from "./concord.js";
@@ -34,12 +35,20 @@ export const DEFAULT_CHANNEL_ALLOWED_COMMANDS = new Set([
   "info",
   "help",
   "welcome",
+  "setwelcome",
   "start",
   "faq",
   "donate",
   "servers",
   "pendingqueue",
 ]);
+
+const ROLE_RANK: Record<ConcordRoleType, number> = {
+  member: 0,
+  moderator: 1,
+  admin: 2,
+  owner: 3,
+};
 
 const MAX_COMMUNITIES = 16;
 const MAX_PROCESSED_WRAPS = 4_096;
@@ -50,7 +59,7 @@ export const MAX_CONCORD_CHANNEL_SUBSCRIPTIONS = 256;
 
 export type ChannelCommandMetadata = Pick<
   CommandContext,
-  "transport" | "communityId" | "channelId" | "channelName" | "isModerator"
+  "transport" | "communityId" | "channelId" | "channelName" | "isModerator" | "senderRole"
 >;
 
 export interface ConcordRelayTransport {
@@ -456,6 +465,44 @@ export class ConcordCommunityManager {
     });
   }
 
+  public getMemberRole(
+    memberPubkey: string,
+    channelId?: string,
+    communityId?: string,
+  ): ConcordRoleType {
+    if (!this.accepting) return "member";
+    const communitiesToCheck: CommunityState[] = [];
+    if (communityId && communityId !== "default" && communityId !== "*") {
+      const matched = this.communities.get(communityId);
+      if (matched) communitiesToCheck.push(matched);
+    } else {
+      communitiesToCheck.push(...this.communities.values());
+    }
+
+    let highestRole: ConcordRoleType = "member";
+    for (const state of communitiesToCheck) {
+      const activeChannels = [...state.channels.values()].filter((ch) => ch.active);
+      const matchedChannel =
+        channelId !== undefined
+          ? activeChannels.find(
+              (ch) =>
+                ch.channelId === channelId ||
+                this.getChannelName(state, ch.channelId)?.toLowerCase() ===
+                  channelId.toLowerCase(),
+            )
+          : undefined;
+      const resolvedChannelId =
+        matchedChannel?.channelId ??
+        this.resolveDefaultChannel(state)?.context.channelId ??
+        "";
+      const role = state.control.roleFor(memberPubkey, resolvedChannelId);
+      if (ROLE_RANK[role] > ROLE_RANK[highestRole]) {
+        highestRole = role;
+      }
+    }
+    return highestRole;
+  }
+
   public stop(): void {
     if (!this.accepting) return;
     this.accepting = false;
@@ -758,10 +805,9 @@ export class ConcordCommunityManager {
     }
 
     const channelName = this.getChannelName(state, channel.channelId);
-    const isModerator = state.control.canManageChannelOrMessages(
-      decoded.author,
-      channel.channelId,
-    );
+    const senderRole = state.control.roleFor(decoded.author, channel.channelId);
+    const isModerator =
+      senderRole === "owner" || senderRole === "admin" || senderRole === "moderator";
 
     const command = parseCommand(decoded.rumor.content);
     if (command) {
@@ -792,6 +838,7 @@ export class ConcordCommunityManager {
           channelId: channel.channelId,
           ...(channelName ? { channelName } : {}),
           isModerator,
+          senderRole,
         },
       );
       return;
@@ -812,6 +859,7 @@ export class ConcordCommunityManager {
       eventId: decoded.rumor.id,
       content: decoded.rumor.content,
       isModerator,
+      senderRole,
       reply: (message: string, extraTags: string[][] = []) =>
         this.publishChannelRumor(state, channel, {
           kind: 9,

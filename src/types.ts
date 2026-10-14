@@ -4,6 +4,7 @@ import type {
   ConcordGroupKey,
   ConcordInviteBundle,
   ConcordInviteChannel,
+  ConcordRoleType,
   ConcordRumor,
   DecodedConcordEvent,
   FoldedConcordControl,
@@ -15,6 +16,7 @@ export type {
   ConcordGroupKey,
   ConcordInviteBundle,
   ConcordInviteChannel,
+  ConcordRoleType,
   ConcordRumor,
   DecodedConcordEvent,
   FoldedConcordControl,
@@ -73,6 +75,7 @@ export interface ConcordChannelMentionContext {
   eventId: string;
   content: string;
   isModerator: boolean;
+  senderRole?: ConcordRoleType;
   reply: (message: string, extraTags?: string[][]) => Promise<void>;
 }
 
@@ -131,6 +134,7 @@ export interface CommandContext {
   channelId?: string;
   channelName?: string;
   isModerator?: boolean;
+  senderRole?: ConcordRoleType;
 }
 
 export type CommandHandler = (ctx: CommandContext) => Promise<void> | void;

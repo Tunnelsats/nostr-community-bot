@@ -9,8 +9,10 @@ import {
 import { NostrCommunityBot } from "../bot.js";
 import { unwrapDirectMessage } from "../nip17-dm.js";
 import {
+  CONCORD_CONTROL_KIND,
   CONCORD_JOIN_KIND,
   computeConcordCommunityId,
+  computeConcordGrantLocator,
   createConcordStreamEvent,
   decodeConcordStreamEvent,
   deriveConcordGroupKey,
@@ -431,6 +433,7 @@ describe("NostrCommunityBot", () => {
     expect(bot.getRegisteredCommands()).toContain("ping");
     expect(bot.isCommandAllowedInChannel("ping")).toBe(true);
     expect(bot.isCommandAllowedInChannel("welcome")).toBe(true);
+    expect(bot.isCommandAllowedInChannel("setwelcome")).toBe(true);
     expect(bot.isCommandAllowedInChannel("link")).toBe(false);
     expect(bot.isCommandAllowedInChannel("custom-pub")).toBe(true);
     expect(bot.isCommandAllowedInChannel("info")).toBe(false);
@@ -928,6 +931,7 @@ describe("NostrCommunityBot", () => {
         channelId: channel.id,
         channelName: "general",
         isModerator: true,
+        senderRole: "owner",
       }),
     );
     await vi.waitFor(() => expect(relayPoolMocks.publish).toHaveBeenCalledTimes(2));
@@ -1043,5 +1047,167 @@ describe("NostrCommunityBot", () => {
 
     emitSubscriptionEvent(1, wrap);
     await vi.waitFor(() => expect(relayPoolMocks.publish).toHaveBeenCalledTimes(2));
+  });
+
+  it("resolves senderRole and isModerator on NIP-17 DM commands from the community default channel", async () => {
+    relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
+    const controlSignerSecret = generateSecretKey();
+    const controlPk = getPublicKey(controlSignerSecret);
+    const modSecret = generateSecretKey();
+    const modPubkey = getPublicKey(modSecret);
+    const memberSecret = generateSecretKey();
+    const memberPubkey = getPublicKey(memberSecret);
+
+    const ownerSalt = "11".repeat(32);
+    const communityRoot = "22".repeat(32);
+    const generalChannelId = "33".repeat(32);
+    const channelKey = "44".repeat(32);
+    const bundle: ConcordInviteBundle = {
+      community_id: computeConcordCommunityId(SENDER_PUBKEY, ownerSalt),
+      owner: SENDER_PUBKEY,
+      owner_salt: ownerSalt,
+      community_root: communityRoot,
+      root_epoch: 1,
+      control_pk: controlPk,
+      channels: [{ id: generalChannelId, key: channelKey, epoch: 1, name: "general" }],
+      relays: [TEST_RELAYS[0]],
+      name: "Test community",
+    };
+
+    const bot = new NostrCommunityBot({
+      nsec: TEST_SECRET_HEX,
+      relays: TEST_RELAYS,
+      concord: {
+        enabled: true,
+        defaultChannelId: "general",
+      },
+    });
+    const handler = vi.fn();
+    bot.registerCommand("setwelcome", handler);
+    await bot.start();
+
+    const inviteWrap = nip59.wrapManyEvents(
+      {
+        kind: 3313,
+        created_at: Math.floor(Date.now() / 1_000),
+        tags: [],
+        content: JSON.stringify(bundle),
+      },
+      SENDER_SECRET,
+      [bot.getPublicKeyHex()],
+    )[1];
+    emitSubscriptionEvent(0, inviteWrap);
+    await vi.waitFor(() => expect(relayPoolMocks.publish).toHaveBeenCalledTimes(1));
+
+    const controlRead = deriveConcordGroupKey(
+      "concord/control",
+      Buffer.from(communityRoot, "hex"),
+      Buffer.from(bundle.community_id, "hex"),
+      1,
+    );
+    const controlGroup = {
+      ...controlRead,
+      secretKey: controlSignerSecret,
+      publicKey: controlPk,
+    };
+    const controlSub = relayPoolMocks.subscribe.mock.calls.find(
+      ([filters]) => filters[0]?.authors?.[0] === controlPk,
+    );
+    expect(controlSub).toBeDefined();
+
+    const modRoleId = "91".repeat(32);
+    controlSub?.[1].onevent?.(
+      createConcordStreamEvent(
+        SENDER_SECRET,
+        controlGroup,
+        {
+          kind: CONCORD_CONTROL_KIND,
+          content: JSON.stringify({
+            role_id: modRoleId,
+            name: "Moderator",
+            position: 2,
+            permissions: "0",
+            scope: { kind: "channel", channel_id: generalChannelId },
+          }),
+          tags: [["vsk", "1"], ["eid", modRoleId], ["ev", "1"]],
+          created_at: Math.floor(Date.now() / 1_000),
+        },
+        { sealKind: 20014 },
+      ),
+    );
+    controlSub?.[1].onevent?.(
+      createConcordStreamEvent(
+        SENDER_SECRET,
+        controlGroup,
+        {
+          kind: CONCORD_CONTROL_KIND,
+          content: JSON.stringify({ member: modPubkey, role_ids: [modRoleId] }),
+          tags: [
+            ["vsk", "3"],
+            ["eid", computeConcordGrantLocator(bundle.community_id, modPubkey)],
+            ["ev", "1"],
+          ],
+          created_at: Math.floor(Date.now() / 1_000),
+        },
+        { sealKind: 20014 },
+      ),
+    );
+
+    await vi.waitFor(() =>
+      expect(bot.getConcordMemberRole(modPubkey)).toBe("moderator"),
+    );
+    expect(bot.getConcordMemberRole(SENDER_PUBKEY)).toBe("owner");
+    expect(bot.getConcordMemberRole(memberPubkey)).toBe("member");
+
+    const ownerDm = nip17.wrapEvent(
+      SENDER_SECRET,
+      { publicKey: bot.getPublicKeyHex() },
+      "/setwelcome Owner welcome!",
+    );
+    emitSubscriptionEvent(0, ownerDm);
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+    expect(handler).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        command: "setwelcome",
+        senderPubkey: SENDER_PUBKEY,
+        transport: "dm",
+        senderRole: "owner",
+        isModerator: true,
+      }),
+    );
+
+    const modDm = nip17.wrapEvent(
+      modSecret,
+      { publicKey: bot.getPublicKeyHex() },
+      "/setwelcome Mod welcome!",
+    );
+    emitSubscriptionEvent(0, modDm);
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(2));
+    expect(handler).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        command: "setwelcome",
+        senderPubkey: modPubkey,
+        transport: "dm",
+        senderRole: "moderator",
+        isModerator: true,
+      }),
+    );
+
+    const memberDm = nip17.wrapEvent(
+      memberSecret,
+      { publicKey: bot.getPublicKeyHex() },
+      "/setwelcome Member attempt",
+    );
+    emitSubscriptionEvent(0, memberDm);
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(3));
+    expect(handler).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        command: "setwelcome",
+        senderPubkey: memberPubkey,
+        transport: "dm",
+        senderRole: "member",
+        isModerator: false,
+      }),
+    );
   });
 });

@@ -7,6 +7,7 @@ import {
   type CommandRegistrationOptions,
   type ConcordChannelMentionHandler,
   type ConcordMemberJoinHandler,
+  type ConcordRoleType,
   type ProcessedEventStore,
   type RelayConnectionStatus,
 } from "./types.js";
@@ -29,6 +30,8 @@ import {
   DEFAULT_CHANNEL_ALLOWED_COMMANDS,
   type ChannelCommandMetadata,
 } from "./concord-manager.js";
+
+export { DEFAULT_CHANNEL_ALLOWED_COMMANDS };
 
 const PROCESSED_EVENT_CACHE_LIMIT = 1_024;
 const DM_RELAY_CACHE_TTL_MS = 5 * 60 * 1_000;
@@ -192,6 +195,17 @@ export class NostrCommunityBot {
     );
   }
 
+  public getConcordMemberRole(
+    memberPubkey: string,
+    channelId?: string,
+    communityId?: string,
+  ): ConcordRoleType {
+    return (
+      this.concordManager?.getMemberRole(memberPubkey, channelId, communityId) ??
+      "member"
+    );
+  }
+
   public getRegisteredCommands(): string[] {
     return Array.from(this.commands.keys());
   }
@@ -214,6 +228,20 @@ export class NostrCommunityBot {
     }
 
     const defaultReply = replyFn || (async () => {});
+    const resolvedRole =
+      metadata?.senderRole ??
+      this.concordManager?.getMemberRole(
+        senderPubkey,
+        metadata?.channelId,
+        metadata?.communityId,
+      );
+    const resolvedIsModerator =
+      metadata?.isModerator ??
+      (resolvedRole !== undefined
+        ? resolvedRole === "owner" ||
+          resolvedRole === "admin" ||
+          resolvedRole === "moderator"
+        : undefined);
     const ctx: CommandContext = {
       command: parsed.command,
       args: parsed.args,
@@ -221,6 +249,10 @@ export class NostrCommunityBot {
       eventId,
       reply: defaultReply,
       ...(metadata ?? {}),
+      ...(resolvedRole !== undefined ? { senderRole: resolvedRole } : {}),
+      ...(resolvedIsModerator !== undefined
+        ? { isModerator: resolvedIsModerator }
+        : {}),
     };
 
     await handler(ctx);
