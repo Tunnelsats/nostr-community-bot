@@ -91,8 +91,49 @@ export interface ConcordConfig {
   onChannelMention?: ConcordChannelMentionHandler;
 }
 
+export type BotCommandArgType = "string" | "int" | "number" | "bool" | "user" | "choice";
+
+export interface BotCommandArgSpec {
+  name: string;
+  type: BotCommandArgType;
+  description?: string;
+  required?: boolean;
+  choices?: string[];
+}
+
+export interface BotCommandManifestArg {
+  name: string;
+  type: BotCommandArgType;
+  description: string;
+  required: boolean;
+  choices: string[];
+}
+
+export interface BotCommandManifestEntry {
+  name: string;
+  description: string;
+  args: BotCommandManifestArg[];
+}
+
+export interface BotCommandManifest {
+  v: 1;
+  commands: BotCommandManifestEntry[];
+}
+
+export interface BotManifestConfig {
+  enabled: boolean;
+  /** When true (default when enabled), non-destructively ensures `"bot": true` (NIP-24) on existing Kind 0 profile metadata. */
+  publishBotProfileFlag?: boolean;
+}
+
 export interface CommandRegistrationOptions {
   allowInChannel?: boolean;
+  /** Short description (<= 200 UTF-8 bytes) published in Kind 10304 Bot Command Manifest */
+  description?: string;
+  /** Typed arguments published in Kind 10304 Bot Command Manifest */
+  args?: BotCommandArgSpec[];
+  /** Set false to exclude from Kind 10304 Bot Command Manifest (defaults to true when description is provided) */
+  includeInManifest?: boolean;
 }
 
 export interface NostrBotConfig {
@@ -108,6 +149,8 @@ export interface NostrBotConfig {
   directMessageReplay?: DirectMessageReplayConfig;
   /** Explicit opt-in for bounded Concord V2 direct-invite and community handling. */
   concord?: ConcordConfig;
+  /** Explicit opt-in for publishing NIP-24 bot profile flag and Kind 10304 Bot Command Manifest. */
+  botManifest?: BotManifestConfig;
 }
 
 export type RelayConnectionState = "disconnected" | "connecting" | "connected" | "reconnecting";

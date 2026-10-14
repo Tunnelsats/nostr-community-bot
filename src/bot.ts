@@ -1,9 +1,15 @@
-import { getPublicKey, verifyEvent } from "nostr-tools/pure";
+import { finalizeEvent, getPublicKey, verifyEvent } from "nostr-tools/pure";
 import { nip19 } from "nostr-tools";
 import {
   NostrBotConfig,
   CommandHandler,
   CommandContext,
+  type BotCommandArgSpec,
+  type BotCommandArgType,
+  type BotCommandManifest,
+  type BotCommandManifestArg,
+  type BotCommandManifestEntry,
+  type BotManifestConfig,
   type CommandRegistrationOptions,
   type ConcordChannelMentionHandler,
   type ConcordMemberJoinHandler,
@@ -33,6 +39,139 @@ import {
 
 export { DEFAULT_CHANNEL_ALLOWED_COMMANDS };
 
+export const BOT_MANIFEST_KIND = 10304;
+
+const MANIFEST_NAME_RE = /^[a-z0-9_-]{1,32}$/;
+const MAX_MANIFEST_COMMANDS = 64;
+const MAX_MANIFEST_ARGS = 8;
+const MAX_MANIFEST_CHOICES = 32;
+const MAX_MANIFEST_CHOICE_BYTES = 32;
+const MAX_MANIFEST_DESCRIPTION_BYTES = 200;
+const MAX_MANIFEST_BYTES = 32_768;
+const MAX_PROFILE_CONTENT_BYTES = 65_536;
+const VALID_MANIFEST_ARG_TYPES = new Set<BotCommandArgType>([
+  "string",
+  "int",
+  "number",
+  "bool",
+  "user",
+  "choice",
+]);
+
+function utf8ByteLength(value: string): number {
+  return Buffer.byteLength(value, "utf8");
+}
+
+function buildManifestArg(spec: BotCommandArgSpec, commandName: string): BotCommandManifestArg {
+  const argName = spec.name.trim();
+  if (!MANIFEST_NAME_RE.test(argName)) {
+    throw new Error(
+      `Invalid argument name "${spec.name}" for command "/${commandName}": must match /^[a-z0-9_-]{1,32}$/.`,
+    );
+  }
+  if (!VALID_MANIFEST_ARG_TYPES.has(spec.type)) {
+    throw new Error(
+      `Invalid argument type "${String(spec.type)}" for "${argName}" in command "/${commandName}".`,
+    );
+  }
+  const description = (spec.description ?? "").trim();
+  if (utf8ByteLength(description) > MAX_MANIFEST_DESCRIPTION_BYTES) {
+    throw new Error(
+      `Argument description for "${argName}" in command "/${commandName}" exceeds ${MAX_MANIFEST_DESCRIPTION_BYTES} bytes.`,
+    );
+  }
+
+  let choices: string[] = [];
+  if (spec.type === "choice") {
+    if (!Array.isArray(spec.choices) || spec.choices.length === 0 || spec.choices.length > MAX_MANIFEST_CHOICES) {
+      throw new Error(
+        `Choice argument "${argName}" in command "/${commandName}" must define 1..${MAX_MANIFEST_CHOICES} choices.`,
+      );
+    }
+    const seenChoices = new Set<string>();
+    choices = spec.choices.map((choice) => {
+      const normalized = choice.trim();
+      const bytes = utf8ByteLength(normalized);
+      if (bytes === 0 || bytes > MAX_MANIFEST_CHOICE_BYTES) {
+        throw new Error(
+          `Choice "${choice}" for argument "${argName}" in command "/${commandName}" must be 1..${MAX_MANIFEST_CHOICE_BYTES} bytes.`,
+        );
+      }
+      if (seenChoices.has(normalized)) {
+        throw new Error(
+          `Duplicate choice "${normalized}" for argument "${argName}" in command "/${commandName}".`,
+        );
+      }
+      seenChoices.add(normalized);
+      return normalized;
+    });
+  } else if (spec.choices && spec.choices.length > 0) {
+    throw new Error(
+      `Argument "${argName}" in command "/${commandName}" cannot define choices when type is "${spec.type}".`,
+    );
+  }
+
+  return {
+    name: argName,
+    type: spec.type,
+    description,
+    required: spec.required ?? false,
+    choices,
+  };
+}
+
+function buildManifestEntry(
+  cleanName: string,
+  options: CommandRegistrationOptions,
+): BotCommandManifestEntry {
+  if (!MANIFEST_NAME_RE.test(cleanName)) {
+    throw new Error(
+      `Invalid manifest command name "${cleanName}": must match /^[a-z0-9_-]{1,32}$/.`,
+    );
+  }
+  const description = (options.description ?? "").trim();
+  const descriptionBytes = utf8ByteLength(description);
+  if (descriptionBytes === 0 || descriptionBytes > MAX_MANIFEST_DESCRIPTION_BYTES) {
+    throw new Error(
+      `Manifest description for command "/${cleanName}" must be 1..${MAX_MANIFEST_DESCRIPTION_BYTES} bytes.`,
+    );
+  }
+  const rawArgs = options.args ?? [];
+  if (rawArgs.length > MAX_MANIFEST_ARGS) {
+    throw new Error(
+      `Command "/${cleanName}" defines ${rawArgs.length} args (max ${MAX_MANIFEST_ARGS}).`,
+    );
+  }
+
+  const seenArgNames = new Set<string>();
+  const args = rawArgs.map((argSpec) => {
+    const built = buildManifestArg(argSpec, cleanName);
+    if (seenArgNames.has(built.name)) {
+      throw new Error(
+        `Duplicate argument "${built.name}" in command "/${cleanName}".`,
+      );
+    }
+    seenArgNames.add(built.name);
+    return built;
+  });
+
+  const firstOptionalIndex = args.findIndex((arg) => !arg.required);
+  if (
+    firstOptionalIndex !== -1 &&
+    args.slice(firstOptionalIndex).some((arg) => arg.required)
+  ) {
+    throw new Error(
+      `Required arguments must precede optional arguments in command "/${cleanName}".`,
+    );
+  }
+
+  return {
+    name: cleanName,
+    description,
+    args,
+  };
+}
+
 const PROCESSED_EVENT_CACHE_LIMIT = 1_024;
 const DM_RELAY_CACHE_TTL_MS = 5 * 60 * 1_000;
 const DM_RELAY_CACHE_LIMIT = 1_024;
@@ -58,12 +197,14 @@ export class NostrCommunityBot {
   private relays: string[];
   private commands: Map<string, CommandHandler> = new Map();
   private channelCommandPermissions: Map<string, boolean> = new Map();
+  private commandManifestEntries: Map<string, BotCommandManifestEntry> = new Map();
   private relayConnections: RelayConnectionManager;
   private processedEventIds = new Set<string>();
   private acceptingRelayEvents = false;
   private readonly hostnameResolver: HostnameResolver;
   private readonly dmRelayCache = new Map<string, DmRelayCacheEntry>();
   private readonly concordManager: ConcordCommunityManager | null;
+  private readonly botManifestConfig: BotManifestConfig | undefined;
   private readonly directMessageCutoff: number;
   private readonly directMessageOfflineGraceSeconds: number;
   private readonly processedEventStore: ProcessedEventStore | undefined;
@@ -94,6 +235,7 @@ export class NostrCommunityBot {
     this.directMessageCutoff = startupTime - offlineGraceSeconds;
     this.directMessageOfflineGraceSeconds = offlineGraceSeconds;
     this.processedEventStore = config.directMessageReplay?.store;
+    this.botManifestConfig = config.botManifest;
     this.hostnameResolver = config.resolveHostname ?? resolveHostname;
     this.relayConnections = new RelayConnectionManager(
       this.relays,
@@ -153,11 +295,148 @@ export class NostrCommunityBot {
     if (!cleanName) {
       throw new Error("Command name cannot be empty.");
     }
+    const shouldIncludeInManifest =
+      options?.includeInManifest !== false &&
+      typeof options?.description === "string" &&
+      options.description.trim().length > 0;
+    if (shouldIncludeInManifest && options) {
+      if (
+        !this.commandManifestEntries.has(cleanName) &&
+        this.commandManifestEntries.size >= MAX_MANIFEST_COMMANDS
+      ) {
+        throw new Error(
+          `Cannot register more than ${MAX_MANIFEST_COMMANDS} manifest commands.`,
+        );
+      }
+      const entry = buildManifestEntry(cleanName, options);
+      this.commandManifestEntries.set(cleanName, entry);
+    } else {
+      this.commandManifestEntries.delete(cleanName);
+    }
+
     this.commands.set(cleanName, handler);
     const allowInChannel =
       options?.allowInChannel ?? DEFAULT_CHANNEL_ALLOWED_COMMANDS.has(cleanName);
     this.channelCommandPermissions.set(cleanName, allowInChannel);
     return this;
+  }
+
+  public getCommandManifest(): BotCommandManifest {
+    return {
+      v: 1,
+      commands: Array.from(this.commandManifestEntries.values()).map((entry) => ({
+        name: entry.name,
+        description: entry.description,
+        args: entry.args.map((arg) => ({
+          name: arg.name,
+          type: arg.type,
+          description: arg.description,
+          required: arg.required,
+          choices: [...arg.choices],
+        })),
+      })),
+    };
+  }
+
+  public async publishBotManifest(): Promise<boolean> {
+    if (!this.acceptingRelayEvents) {
+      throw new Error("Nostr bot is not running");
+    }
+    const manifest = this.getCommandManifest();
+    if (manifest.commands.length === 0) {
+      return false;
+    }
+    const content = JSON.stringify(manifest);
+    if (utf8ByteLength(content) > MAX_MANIFEST_BYTES) {
+      throw new Error(
+        `Kind ${BOT_MANIFEST_KIND} Bot Command Manifest exceeds ${MAX_MANIFEST_BYTES} bytes.`,
+      );
+    }
+    const event = finalizeEvent(
+      {
+        kind: BOT_MANIFEST_KIND,
+        created_at: Math.floor(Date.now() / 1_000),
+        tags: [],
+        content,
+      },
+      this.secretKey,
+    );
+    await this.relayConnections.publish(event);
+    return true;
+  }
+
+  public async ensureBotProfileFlag(): Promise<boolean> {
+    if (!this.acceptingRelayEvents) {
+      throw new Error("Nostr bot is not running");
+    }
+    const events = await this.relayConnections.query({
+      kinds: [0],
+      authors: [this.pubkeyHex],
+      limit: 10,
+    });
+    const candidates = events
+      .filter(
+        (event) =>
+          event.kind === 0 &&
+          event.pubkey === this.pubkeyHex &&
+          typeof event.content === "string" &&
+          utf8ByteLength(event.content) <= MAX_PROFILE_CONTENT_BYTES &&
+          Array.isArray(event.tags) &&
+          verifyEvent(event),
+      )
+      .sort((left, right) =>
+        right.created_at !== left.created_at
+          ? right.created_at - left.created_at
+          : right.id.localeCompare(left.id),
+      );
+
+    let latestEvent: NostrEvent | undefined;
+    let parsedMetadata: Record<string, unknown> | undefined;
+    for (const candidate of candidates) {
+      try {
+        const parsed: unknown = JSON.parse(candidate.content);
+        if (
+          typeof parsed === "object" &&
+          parsed !== null &&
+          !Array.isArray(parsed) &&
+          Object.keys(parsed).length > 0
+        ) {
+          latestEvent = candidate;
+          parsedMetadata = parsed as Record<string, unknown>;
+          break;
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    if (!latestEvent || !parsedMetadata) {
+      console.warn(
+        "[Nostr] Skipping Kind 0 bot flag update: no existing Kind 0 profile metadata found on connected relays",
+      );
+      return false;
+    }
+
+    if (parsedMetadata.bot === true) {
+      await this.relayConnections.publish(latestEvent);
+      return true;
+    }
+
+    const updatedProfile = {
+      ...parsedMetadata,
+      bot: true,
+    };
+    const updatedEvent = finalizeEvent(
+      {
+        kind: 0,
+        created_at: Math.max(Math.floor(Date.now() / 1_000), latestEvent.created_at + 1),
+        tags: latestEvent.tags.map((tag) => [...tag]),
+        content: JSON.stringify(updatedProfile),
+      },
+      this.secretKey,
+    );
+    await this.relayConnections.publish(updatedEvent);
+    return true;
   }
 
   public isCommandAllowedInChannel(command: string): boolean {
@@ -272,6 +551,28 @@ export class NostrCommunityBot {
       this.concordManager?.stop();
       await this.relayConnections.stop().catch(() => undefined);
       throw error;
+    }
+
+    if (this.botManifestConfig?.enabled) {
+      await this.syncBotProfileAndManifest();
+    }
+  }
+
+  private async syncBotProfileAndManifest(): Promise<void> {
+    if (!this.acceptingRelayEvents || !this.botManifestConfig?.enabled) {
+      return;
+    }
+    if (this.botManifestConfig.publishBotProfileFlag !== false) {
+      try {
+        await this.ensureBotProfileFlag();
+      } catch (error) {
+        console.warn("[Nostr] Failed to ensure Kind 0 bot profile flag:", error);
+      }
+    }
+    try {
+      await this.publishBotManifest();
+    } catch (error) {
+      console.warn("[Nostr] Failed to publish Kind 10304 bot command manifest:", error);
     }
   }
 
@@ -445,6 +746,9 @@ export class NostrCommunityBot {
         if (!this.acceptingRelayEvents) return;
         await this.concordManager.acceptDirectInvite(invite);
         this.rememberEvent(event.id);
+        if (this.botManifestConfig?.enabled) {
+          await this.syncBotProfileAndManifest();
+        }
       } catch {
         return;
       }

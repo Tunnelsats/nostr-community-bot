@@ -1,4 +1,4 @@
-export { NostrCommunityBot } from "./bot.js";
+export { NostrCommunityBot, BOT_MANIFEST_KIND } from "./bot.js";
 export * from "./types.js";
 export * from "./concord.js";
 export {
