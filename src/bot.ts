@@ -237,6 +237,7 @@ export class NostrCommunityBot {
     } catch (error) {
       this.acceptingRelayEvents = false;
       this.concordManager?.stop();
+      await this.relayConnections.stop().catch(() => undefined);
       throw error;
     }
   }
@@ -405,10 +406,12 @@ export class NostrCommunityBot {
       rumor = unwrapDirectMessage(event, this.secretKey, this.pubkeyHex);
     } catch {
       if (!this.concordManager) return;
+      if (this.processedEventIds.has(event.id)) return;
       try {
         const invite = unwrapDirectInvite(event, this.secretKey, this.pubkeyHex);
-        if (!this.acceptingRelayEvents || !this.rememberEvent(event.id)) return;
+        if (!this.acceptingRelayEvents) return;
         await this.concordManager.acceptDirectInvite(invite);
+        this.rememberEvent(event.id);
       } catch {
         return;
       }

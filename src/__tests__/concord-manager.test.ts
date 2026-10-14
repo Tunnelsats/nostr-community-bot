@@ -294,9 +294,12 @@ describe("ConcordCommunityManager", () => {
     ]);
   });
 
-  it("restores persisted communities without republishing duplicate Join events", async () => {
+  it("restores persisted communities without republishing duplicate Join events even when original invite expires_at has passed", async () => {
     currentHarness.persistedCommunities.push({
-      bundle: bundle(),
+      bundle: {
+        ...bundle(),
+        expires_at: 1_600_000_000,
+      },
       joinPublished: true,
     });
 
@@ -313,15 +316,22 @@ describe("ConcordCommunityManager", () => {
     expect(findSubscription(privateGroup.publicKey)).toBeDefined();
   });
 
-  it("retries the Join publication after a transient relay failure", async () => {
+  it("retries the Join publication after a transient relay failure and persists joinPublished=false before publishing", async () => {
     currentHarness.publishToRelays.mockRejectedValueOnce(new Error("relay unavailable"));
 
     await expect(
       currentHarness.manager.acceptDirectInvite(directInviteRumor()),
     ).rejects.toThrow("relay unavailable");
+    expect(currentHarness.persistedCommunities).toEqual([
+      { bundle: bundle(), joinPublished: false },
+    ]);
+
     await currentHarness.manager.acceptDirectInvite(directInviteRumor());
 
     expect(currentHarness.published).toHaveLength(1);
+    expect(currentHarness.persistedCommunities).toEqual([
+      { bundle: bundle(), joinPublished: true },
+    ]);
   });
 
   it("does not publish another Join for a differently wrapped duplicate invite", async () => {

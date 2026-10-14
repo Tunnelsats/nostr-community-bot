@@ -206,7 +206,7 @@ export class ConcordCommunityManager {
     const persistedList = await this.store.loadCommunities();
     for (const persisted of persistedList) {
       if (!this.accepting) return;
-      const bundle = validateConcordInvite(persisted.bundle, this.now());
+      const bundle = validateConcordInvite(persisted.bundle, 0);
       if (!bundle) continue;
       if (this.communities.has(bundle.community_id)) continue;
       if (this.communities.size >= MAX_COMMUNITIES) break;
@@ -316,6 +316,10 @@ export class ConcordCommunityManager {
     console.log(`[Concord] Community relay registration completed for ${bundle.relays.length} relay(s)`);
     if (!this.accepting) return;
     const state = this.registerCommunityState(bundle, false);
+    await this.store?.saveCommunity({
+      bundle: state.bundle,
+      joinPublished: false,
+    });
     console.log(`[Concord] Publishing Kind 3306 Join for community ${bundle.community_id.slice(0, 8)}...`);
     await this.publishJoin(bundle);
     state.joinPublished = true;

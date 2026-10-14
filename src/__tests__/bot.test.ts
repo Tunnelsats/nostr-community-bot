@@ -1001,4 +1001,47 @@ describe("NostrCommunityBot", () => {
     await bot.publishConcordChannelMessage("default", "general", "Proactive announcement");
     expect(relayPoolMocks.publish).toHaveBeenCalledTimes(4);
   });
+
+  it("stops relay connections when restoreCommunities throws during start", async () => {
+    relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
+    const bot = new NostrCommunityBot({
+      nsec: TEST_SECRET_HEX,
+      relays: TEST_RELAYS,
+      concord: {
+        enabled: true,
+        store: {
+          loadCommunities: async () => {
+            throw new Error("store failure");
+          },
+          saveCommunity: async () => undefined,
+        },
+      },
+    });
+
+    await expect(bot.start()).rejects.toThrow("store failure");
+    expect(relayPoolMocks.close).toHaveBeenCalledWith(TEST_RELAYS);
+    expect(bot.getRelayStatuses()).toEqual(
+      TEST_RELAYS.map((url) => ({ url, state: "disconnected", reconnectAttempts: 0 })),
+    );
+  });
+
+  it("allows retrying the same Concord invite gift-wrap event when Join publication fails transiently", async () => {
+    relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
+    relayPoolMocks.publish
+      .mockRejectedValueOnce(new Error("transient relay error"))
+      .mockResolvedValue("saved");
+    const bot = new NostrCommunityBot({
+      nsec: TEST_SECRET_HEX,
+      relays: TEST_RELAYS,
+      concord: { enabled: true },
+    });
+    await bot.start();
+    const { wrap } = createInboundConcordInvite(bot.getPublicKeyHex());
+
+    emitSubscriptionEvent(0, wrap);
+    await vi.waitFor(() => expect(relayPoolMocks.publish).toHaveBeenCalledTimes(1));
+
+    emitSubscriptionEvent(1, wrap);
+    await vi.waitFor(() => expect(relayPoolMocks.publish).toHaveBeenCalledTimes(2));
+  });
 });
