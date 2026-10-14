@@ -1,31 +1,66 @@
-import { getPublicKey } from "nostr-tools/pure";
+import { getPublicKey, verifyEvent } from "nostr-tools/pure";
 import { nip19 } from "nostr-tools";
 import {
   NostrBotConfig,
   CommandHandler,
   CommandContext,
+  type CommandRegistrationOptions,
+  type ConcordChannelMentionHandler,
+  type ConcordMemberJoinHandler,
   type ProcessedEventStore,
+  type RelayConnectionStatus,
 } from "./types.js";
 import { parseSecretKey, parseCommand } from "./event-utils.js";
 import { RelayConnectionManager } from "./relay-connection-manager.js";
-import type { RelayConnectionStatus } from "./types.js";
 import type { NostrEvent } from "nostr-tools/pure";
-import { createDirectMessageReply, unwrapDirectMessage } from "./nip17-dm.js";
+import {
+  createDirectMessage,
+  createDirectMessageReply,
+  unwrapDirectInvite,
+  unwrapDirectMessage,
+} from "./nip17-dm.js";
+import {
+  resolveHostname,
+  validateDmRelayUrl,
+  type HostnameResolver,
+} from "./dm-relays.js";
+import {
+  ConcordCommunityManager,
+  DEFAULT_CHANNEL_ALLOWED_COMMANDS,
+  type ChannelCommandMetadata,
+} from "./concord-manager.js";
 
 const PROCESSED_EVENT_CACHE_LIMIT = 1_024;
+const DM_RELAY_CACHE_TTL_MS = 5 * 60 * 1_000;
+const DM_RELAY_CACHE_LIMIT = 1_024;
+const MAX_DM_RELAYS = 3;
+const MAX_DM_RELAY_TAGS = 64;
+const MAX_DM_RELAY_TAG_VALUES = 4;
+const MAX_DM_RELAY_TAG_VALUE_LENGTH = 2_048;
+const MAX_DM_RELAY_CONTENT_LENGTH = 1_024;
+const DIRECT_MESSAGE_NOT_READY = "Nostr direct message recipient is not ready";
 const DEFAULT_DM_OFFLINE_GRACE_SECONDS = 5 * 60;
 const MAX_DM_OFFLINE_GRACE_SECONDS = 7 * 24 * 60 * 60;
 const NIP59_GIFT_WRAP_BACKDATE_SECONDS = 2 * 24 * 60 * 60;
 const MAX_DM_FUTURE_SKEW_SECONDS = 5 * 60;
+
+interface DmRelayCacheEntry {
+  expiresAt: number;
+  relays: string[];
+}
 
 export class NostrCommunityBot {
   private secretKey: Uint8Array;
   private pubkeyHex: string;
   private relays: string[];
   private commands: Map<string, CommandHandler> = new Map();
+  private channelCommandPermissions: Map<string, boolean> = new Map();
   private relayConnections: RelayConnectionManager;
   private processedEventIds = new Set<string>();
   private acceptingRelayEvents = false;
+  private readonly hostnameResolver: HostnameResolver;
+  private readonly dmRelayCache = new Map<string, DmRelayCacheEntry>();
+  private readonly concordManager: ConcordCommunityManager | null;
   private readonly directMessageCutoff: number;
   private readonly directMessageOfflineGraceSeconds: number;
   private readonly processedEventStore: ProcessedEventStore | undefined;
@@ -56,7 +91,30 @@ export class NostrCommunityBot {
     this.directMessageCutoff = startupTime - offlineGraceSeconds;
     this.directMessageOfflineGraceSeconds = offlineGraceSeconds;
     this.processedEventStore = config.directMessageReplay?.store;
-    this.relayConnections = new RelayConnectionManager(this.relays);
+    this.hostnameResolver = config.resolveHostname ?? resolveHostname;
+    this.relayConnections = new RelayConnectionManager(
+      this.relays,
+      undefined,
+      this.hostnameResolver,
+    );
+    this.concordManager = config.concord?.enabled
+      ? new ConcordCommunityManager({
+          secretKey: this.secretKey,
+          pubkey: this.pubkeyHex,
+          relayTransport: this.relayConnections,
+          processMessage: (text, senderPubkey, eventId, reply, metadata) =>
+            this.processMessage(text, senderPubkey, eventId, reply, metadata),
+          isCommandAllowedInChannel: (command) => this.isCommandAllowedInChannel(command),
+          isFreshEvent: (createdAt) => this.isFreshDirectMessage(createdAt),
+          persistEventAcceptance: (eventId) => this.persistEventAcceptance(eventId),
+          sendDirectMessage: (recipientPubkey, message) =>
+            this.sendDirectMessage(recipientPubkey, message),
+          store: config.concord.store,
+          defaultChannelId: config.concord.defaultChannelId,
+          onMemberJoin: config.concord.onMemberJoin,
+          onChannelMention: config.concord.onChannelMention,
+        })
+      : null;
     this.relayConnections.registerSubscription(
       {
         kinds: [1059],
@@ -83,13 +141,55 @@ export class NostrCommunityBot {
     return this.relayConnections.getRelayStatuses();
   }
 
-  public registerCommand(name: string, handler: CommandHandler): this {
+  public registerCommand(
+    name: string,
+    handler: CommandHandler,
+    options?: CommandRegistrationOptions,
+  ): this {
     const cleanName = name.trim().toLowerCase().replace(/^\//, "");
     if (!cleanName) {
       throw new Error("Command name cannot be empty.");
     }
     this.commands.set(cleanName, handler);
+    const allowInChannel =
+      options?.allowInChannel ?? DEFAULT_CHANNEL_ALLOWED_COMMANDS.has(cleanName);
+    this.channelCommandPermissions.set(cleanName, allowInChannel);
     return this;
+  }
+
+  public isCommandAllowedInChannel(command: string): boolean {
+    const cleanName = command.trim().toLowerCase().replace(/^\//, "");
+    return (
+      this.channelCommandPermissions.get(cleanName) ??
+      DEFAULT_CHANNEL_ALLOWED_COMMANDS.has(cleanName)
+    );
+  }
+
+  public onMemberJoin(handler: ConcordMemberJoinHandler): this {
+    this.concordManager?.setOnMemberJoin(handler);
+    return this;
+  }
+
+  public onChannelMention(handler: ConcordChannelMentionHandler): this {
+    this.concordManager?.setOnChannelMention(handler);
+    return this;
+  }
+
+  public async publishConcordChannelMessage(
+    communityId: string,
+    channelId: string,
+    message: string,
+    extraTags?: string[][],
+  ): Promise<void> {
+    if (!this.acceptingRelayEvents || !this.concordManager) {
+      throw new Error("Concord community manager is not running");
+    }
+    await this.concordManager.publishChannelMessage(
+      communityId,
+      channelId,
+      message,
+      extraTags,
+    );
   }
 
   public getRegisteredCommands(): string[] {
@@ -101,6 +201,7 @@ export class NostrCommunityBot {
     senderPubkey: string,
     eventId: string,
     replyFn?: (msg: string) => Promise<void>,
+    metadata?: ChannelCommandMetadata,
   ): Promise<boolean> {
     const parsed = parseCommand(text);
     if (!parsed) {
@@ -119,6 +220,7 @@ export class NostrCommunityBot {
       senderPubkey,
       eventId,
       reply: defaultReply,
+      ...(metadata ?? {}),
     };
 
     await handler(ctx);
@@ -129,19 +231,124 @@ export class NostrCommunityBot {
     this.acceptingRelayEvents = true;
     try {
       await this.relayConnections.start();
+      if (this.concordManager) {
+        await this.concordManager.restoreCommunities();
+      }
     } catch (error) {
       this.acceptingRelayEvents = false;
+      this.concordManager?.stop();
       throw error;
     }
   }
 
   public async stop(): Promise<void> {
     this.acceptingRelayEvents = false;
+    this.concordManager?.stop();
     try {
       await this.relayConnections.stop();
     } finally {
       this.processedEventIds.clear();
+      this.dmRelayCache.clear();
     }
+  }
+
+  public async sendDirectMessage(recipientPubkey: string, message: string): Promise<void> {
+    if (!this.acceptingRelayEvents) {
+      throw new Error("Nostr direct message sender is not running");
+    }
+
+    const [senderRelays, recipientRelays] = await Promise.all([
+      this.getDmRelays(this.pubkeyHex),
+      this.getDmRelays(recipientPubkey),
+    ]);
+    const copies = createDirectMessage(this.secretKey, recipientPubkey, message);
+
+    await this.relayConnections.publishToRelays(copies.sender, senderRelays);
+    await this.relayConnections.publishToRelays(copies.recipient, recipientRelays);
+  }
+
+  private async getDmRelays(pubkey: string): Promise<string[]> {
+    const cached = this.dmRelayCache.get(pubkey);
+    if (cached && cached.expiresAt > Date.now()) {
+      try {
+        const relays = await this.validateDmRelays(cached.relays);
+        this.dmRelayCache.delete(pubkey);
+        this.dmRelayCache.set(pubkey, cached);
+        return relays;
+      } catch {
+        this.dmRelayCache.delete(pubkey);
+        throw new Error(DIRECT_MESSAGE_NOT_READY);
+      }
+    }
+
+    if (!/^[0-9a-f]{64}$/.test(pubkey)) throw new Error(DIRECT_MESSAGE_NOT_READY);
+    const events = await this.relayConnections.query({
+      kinds: [10050],
+      authors: [pubkey],
+      limit: 10,
+    });
+    const latest = events
+      .filter(
+        (event) =>
+          event.kind === 10050 &&
+          event.pubkey === pubkey &&
+          this.isBoundedDmRelayEvent(event) &&
+          verifyEvent(event),
+      )
+      .sort((left, right) => right.created_at - left.created_at)[0];
+    if (!latest) throw new Error(DIRECT_MESSAGE_NOT_READY);
+
+    const candidates = [
+      ...new Set(
+        latest.tags
+          .filter((tag) => tag[0] === "relay" && typeof tag[1] === "string")
+          .map((tag) => tag[1]),
+      ),
+    ];
+    const relays = await this.validateDmRelays(candidates);
+
+    if (this.dmRelayCache.size >= DM_RELAY_CACHE_LIMIT) {
+      const oldestPubkey = this.dmRelayCache.keys().next().value;
+      if (oldestPubkey) this.dmRelayCache.delete(oldestPubkey);
+    }
+    this.dmRelayCache.set(pubkey, {
+      expiresAt: Date.now() + DM_RELAY_CACHE_TTL_MS,
+      relays,
+    });
+    return [...relays];
+  }
+
+  private isBoundedDmRelayEvent(event: NostrEvent): boolean {
+    if (typeof event.content !== "string" || !Array.isArray(event.tags)) {
+      return false;
+    }
+    return (
+      event.content.length <= MAX_DM_RELAY_CONTENT_LENGTH &&
+      event.tags.length <= MAX_DM_RELAY_TAGS &&
+      event.tags.every(
+        (tag) =>
+          Array.isArray(tag) &&
+          tag.length <= MAX_DM_RELAY_TAG_VALUES &&
+          tag.every(
+            (value) =>
+              typeof value === "string" &&
+              value.length <= MAX_DM_RELAY_TAG_VALUE_LENGTH,
+          ),
+      )
+    );
+  }
+
+  private async validateDmRelays(candidates: string[]): Promise<string[]> {
+    if (candidates.length === 0 || candidates.length > MAX_DM_RELAYS) {
+      throw new Error(DIRECT_MESSAGE_NOT_READY);
+    }
+    const validated = await Promise.all(
+      candidates.map((url) => validateDmRelayUrl(url, this.hostnameResolver)),
+    );
+    if (validated.some((url) => url === null)) {
+      throw new Error(DIRECT_MESSAGE_NOT_READY);
+    }
+    return validated as string[];
   }
 
   private rememberEvent(eventId: string): boolean {
@@ -197,6 +404,14 @@ export class NostrCommunityBot {
     try {
       rumor = unwrapDirectMessage(event, this.secretKey, this.pubkeyHex);
     } catch {
+      if (!this.concordManager) return;
+      try {
+        const invite = unwrapDirectInvite(event, this.secretKey, this.pubkeyHex);
+        if (!this.acceptingRelayEvents || !this.rememberEvent(event.id)) return;
+        await this.concordManager.acceptDirectInvite(invite);
+      } catch {
+        return;
+      }
       return;
     }
 
@@ -217,6 +432,8 @@ export class NostrCommunityBot {
       await this.relayConnections.publish(response);
     };
 
-    await this.processMessage(rumor.content, rumor.pubkey, rumor.id, reply);
+    await this.processMessage(rumor.content, rumor.pubkey, rumor.id, reply, {
+      transport: "dm",
+    });
   }
 }

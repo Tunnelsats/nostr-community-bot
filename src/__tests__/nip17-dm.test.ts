@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { nip44 } from "nostr-tools";
+import { nip44, nip59 } from "nostr-tools";
 import {
   finalizeEvent,
   generateSecretKey,
@@ -9,8 +9,10 @@ import {
   type UnsignedEvent,
 } from "nostr-tools/pure";
 import {
+  createDirectMessage,
   createDirectMessageReply,
   MAX_ENCRYPTED_CONTENT_LENGTH,
+  unwrapDirectInvite,
   unwrapDirectMessage,
 } from "../nip17-dm.js";
 
@@ -25,6 +27,7 @@ const OTHER_PUBKEY = getPublicKey(OTHER_SECRET);
 
 interface BuildOptions {
   rumor?: Partial<UnsignedEvent> & { id?: string; sig?: string };
+  omitRumorId?: boolean;
   seal?: Partial<NostrEvent>;
   wrap?: Partial<NostrEvent>;
   sealPlaintext?: string;
@@ -54,7 +57,9 @@ function createRumor(overrides: BuildOptions["rumor"] = {}): UnsignedEvent & { i
 
 function buildGiftWrap(options: BuildOptions = {}): NostrEvent {
   const rumor = createRumor(options.rumor);
-  const rumorPlaintext = options.rumorPlaintext ?? JSON.stringify(rumor);
+  const rumorPlaintext =
+    options.rumorPlaintext ??
+    JSON.stringify(options.omitRumorId ? { ...rumor, id: undefined } : rumor);
   const seal = finalizeEvent(
     {
       kind: options.seal?.kind ?? 13,
@@ -84,6 +89,14 @@ function corruptSignature(signature: string): string {
 }
 
 describe("unwrapDirectMessage", () => {
+  it("keeps a missing id invalid for kind-14 direct messages", () => {
+    const wrap = buildGiftWrap({ omitRumorId: true });
+
+    expect(() => unwrapDirectMessage(wrap, BOT_SECRET, BOT_PUBKEY)).toThrow(
+      "Invalid NIP-17 direct message",
+    );
+  });
+
   it("unwraps a valid gift wrap and authenticates the inner sender", () => {
     const wrap = buildGiftWrap();
 
@@ -224,6 +237,64 @@ describe("unwrapDirectMessage", () => {
   });
 });
 
+describe("unwrapDirectInvite", () => {
+  it("computes the id omitted by Armada's kind-3313 rumor", () => {
+    const template = {
+      pubkey: SENDER_PUBKEY,
+      created_at: 1_700_000_000,
+      kind: 3313,
+      tags: [],
+      content: '{"community_id":"armada"}',
+    };
+    const wrap = buildGiftWrap({
+      rumor: template,
+      omitRumorId: true,
+      wrap: { tags: [["p", BOT_PUBKEY], ["k", "3313"]] },
+    });
+
+    const rumor = unwrapDirectInvite(wrap, BOT_SECRET, BOT_PUBKEY);
+
+    expect(rumor.id).toBe(getEventHash(template));
+    expect(rumor.kind).toBe(3313);
+    expect(rumor.pubkey).toBe(SENDER_PUBKEY);
+  });
+
+  it("unwraps an authenticated kind-3313 rumor with an empty rumor tag set", () => {
+    const wrap = buildGiftWrap({
+      rumor: { kind: 3313, tags: [], content: '{"community_id":"opaque"}' },
+      wrap: { tags: [["p", BOT_PUBKEY], ["k", "3313"]] },
+    });
+
+    const rumor = unwrapDirectInvite(wrap, BOT_SECRET, BOT_PUBKEY);
+
+    expect(rumor.kind).toBe(3313);
+    expect(rumor.pubkey).toBe(SENDER_PUBKEY);
+    expect(rumor.tags).toEqual([]);
+  });
+
+  it("rejects a direct invite with routing tags inside the rumor", () => {
+    const wrap = buildGiftWrap({
+      rumor: { kind: 3313, tags: [["p", BOT_PUBKEY]] },
+      wrap: { tags: [["p", BOT_PUBKEY], ["k", "3313"]] },
+    });
+
+    expect(() => unwrapDirectInvite(wrap, BOT_SECRET, BOT_PUBKEY)).toThrow(
+      "Invalid Concord direct invite",
+    );
+  });
+
+  it("rejects a direct invite with a false supplied rumor id", () => {
+    const wrap = buildGiftWrap({
+      rumor: { kind: 3313, tags: [], id: "00".repeat(32) },
+      wrap: { tags: [["p", BOT_PUBKEY], ["k", "3313"]] },
+    });
+
+    expect(() => unwrapDirectInvite(wrap, BOT_SECRET, BOT_PUBKEY)).toThrow(
+      "Invalid Concord direct invite",
+    );
+  });
+});
+
 describe("createDirectMessageReply", () => {
   it("creates a fresh gift-wrapped kind 14 reply addressed to the recipient", () => {
     const inbound = createRumor();
@@ -249,5 +320,33 @@ describe("createDirectMessageReply", () => {
     expect(() =>
       createDirectMessageReply(BOT_SECRET, "not-a-pubkey", "secret reply", "bad-id"),
     ).toThrow("Invalid NIP-17 reply");
+  });
+});
+
+describe("createDirectMessage", () => {
+  it("creates sender and recipient gift wraps for the same proactive rumor", () => {
+    const copies = createDirectMessage(BOT_SECRET, SENDER_PUBKEY, "Subscription expires soon");
+
+    expect(copies.sender.tags).toEqual([["p", BOT_PUBKEY]]);
+    expect(copies.recipient.tags).toEqual([["p", SENDER_PUBKEY]]);
+
+    const senderRumor = nip59.unwrapEvent(copies.sender, BOT_SECRET);
+    const recipientRumor = unwrapDirectMessage(copies.recipient, SENDER_SECRET, SENDER_PUBKEY);
+    expect(senderRumor.id).toBe(recipientRumor.id);
+    expect(recipientRumor.pubkey).toBe(BOT_PUBKEY);
+    expect(recipientRumor.tags).toEqual([["p", SENDER_PUBKEY]]);
+    expect(recipientRumor.content).toBe("Subscription expires soon");
+  });
+
+  it("rejects invalid proactive message inputs with a sanitized error", () => {
+    expect(() => createDirectMessage(BOT_SECRET, "invalid", "secret alert")).toThrow(
+      "Invalid NIP-17 direct message output",
+    );
+    expect(() => createDirectMessage(BOT_SECRET, SENDER_PUBKEY, "")).toThrow(
+      "Invalid NIP-17 direct message output",
+    );
+    expect(() => createDirectMessage(BOT_SECRET, SENDER_PUBKEY, "x".repeat(4_097))).toThrow(
+      "Invalid NIP-17 direct message output",
+    );
   });
 });

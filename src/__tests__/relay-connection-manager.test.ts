@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Filter, NostrEvent } from "nostr-tools";
 import {
+  createPublicWebSocketImplementation,
+  MAX_PERSISTENT_RELAY_COUNT,
   RelayConnectionManager,
   type RelayLike,
   type RelayPoolLike,
@@ -142,7 +144,84 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+describe("secure relay WebSocket", () => {
+  it("installs checked DNS lookup, disables redirects, and bounds payloads", () => {
+    let capturedOptions: Record<string, unknown> | undefined;
+    class FakeWebSocket {
+      public constructor(
+        _address: string | URL,
+        _protocols?: string | string[],
+        options?: Record<string, unknown>,
+      ) {
+        capturedOptions = options;
+      }
+    }
+    const Implementation = createPublicWebSocketImplementation(
+      async () => ["93.184.216.34"],
+      FakeWebSocket as unknown as typeof import("ws").default,
+    );
+
+    new Implementation("wss://relay.example");
+
+    expect(capturedOptions).toEqual(
+      expect.objectContaining({
+        followRedirects: false,
+        lookup: expect.any(Function),
+        maxPayload: 1024 * 1024,
+      }),
+    );
+
+    expect(() => new Implementation("wss://127.0.0.1")).toThrow(
+      "public IP address",
+    );
+  });
+});
+
 describe("RelayConnectionManager startup", () => {
+  it("adds bounded persistent community relays and attaches existing subscriptions", async () => {
+    const configuredRelay = new FakeRelay();
+    const communityRelay = new FakeRelay();
+    const pool = new FakePool(async (url) =>
+      url === RELAYS[0] ? configuredRelay : communityRelay,
+    );
+    const manager = new RelayConnectionManager([RELAYS[0]], () => pool);
+    manager.registerSubscription(GIFT_WRAP_FILTER, () => undefined);
+    await manager.start();
+
+    await manager.addRelays(["wss://community.example", "wss://community.example"]);
+
+    expect(pool.ensureRelayCalls).toEqual([RELAYS[0], "wss://community.example"]);
+    expect(communityRelay.subscribeCalls[0].filters).toEqual([GIFT_WRAP_FILTER]);
+    expect(manager.getRelayStatuses()).toContainEqual({
+      url: "wss://community.example",
+      state: "connected",
+      reconnectAttempts: 0,
+    });
+    await manager.stop();
+    expect(pool.closeCalls.at(-1)?.sort()).toEqual(
+      [RELAYS[0], "wss://community.example"].sort(),
+    );
+  });
+
+  it("rejects unsafe or excessive persistent relay additions before connecting", async () => {
+    const pool = new FakePool(async () => new FakeRelay());
+    const manager = new RelayConnectionManager([RELAYS[0]], () => pool);
+    await manager.start();
+
+    await expect(manager.addRelays(["wss://127.0.0.1"])).rejects.toThrow(
+      "public IP address",
+    );
+    await expect(
+      manager.addRelays(
+        Array.from(
+          { length: MAX_PERSISTENT_RELAY_COUNT },
+          (_, index) => `wss://community-${index}.example`,
+        ),
+      ),
+    ).rejects.toThrow("relay limit");
+    expect(pool.ensureRelayCalls).toEqual([RELAYS[0]]);
+  });
+
   it("starts every configured relay concurrently and tracks successful connections", async () => {
     const first = deferred<RelayLike>();
     const second = deferred<RelayLike>();
@@ -696,5 +775,34 @@ describe("RelayConnectionManager subscriptions and publishing", () => {
       expect(error).toBeInstanceOf(Error);
       expect((error as Error).message).not.toContain("sensitive");
     });
+  });
+
+  it("closes a temporary target relay as soon as publication settles", async () => {
+    const configuredRelay = new FakeRelay();
+    const targetRelay = new FakeRelay();
+    const targetUrl = "wss://inbox.example";
+    const pool = new FakePool(async (url) =>
+      url === RELAYS[0] ? configuredRelay : targetRelay,
+    );
+    const manager = new RelayConnectionManager([RELAYS[0]], () => pool);
+    await manager.start();
+
+    await manager.publishToRelays(TEST_EVENT, [targetUrl]);
+
+    expect(targetRelay.publishCalls).toEqual([TEST_EVENT]);
+    expect(pool.closeCalls).toContainEqual([targetUrl]);
+  });
+
+  it("reuses a configured relay when the target URL is canonically equivalent", async () => {
+    const configuredRelay = new FakeRelay();
+    const pool = new FakePool(async () => configuredRelay);
+    const manager = new RelayConnectionManager([RELAYS[0]], () => pool);
+    await manager.start();
+
+    await manager.publishToRelays(TEST_EVENT, [`${RELAYS[0]}/`]);
+
+    expect(configuredRelay.publishCalls).toEqual([TEST_EVENT]);
+    expect(pool.ensureRelayCalls).toEqual([RELAYS[0]]);
+    expect(pool.closeCalls).toEqual([]);
   });
 });

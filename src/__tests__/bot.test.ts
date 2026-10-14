@@ -1,8 +1,21 @@
 import { beforeEach, describe, it, expect, vi } from "vitest";
 import { nip17, nip19, nip59 } from "nostr-tools";
-import { generateSecretKey, getPublicKey, type NostrEvent } from "nostr-tools/pure";
+import {
+  finalizeEvent,
+  generateSecretKey,
+  getPublicKey,
+  type NostrEvent,
+} from "nostr-tools/pure";
 import { NostrCommunityBot } from "../bot.js";
 import { unwrapDirectMessage } from "../nip17-dm.js";
+import {
+  CONCORD_JOIN_KIND,
+  computeConcordCommunityId,
+  createConcordStreamEvent,
+  decodeConcordStreamEvent,
+  deriveConcordGroupKey,
+  type ConcordInviteBundle,
+} from "../concord.js";
 
 const relayPoolMocks = vi.hoisted(() => ({
   ensureRelay: vi.fn(),
@@ -25,6 +38,18 @@ const BOT_SECRET = generateSecretKey();
 const TEST_SECRET_HEX = Buffer.from(BOT_SECRET).toString("hex");
 const SENDER_SECRET = generateSecretKey();
 const SENDER_PUBKEY = getPublicKey(SENDER_SECRET);
+
+function createDmRelayList(secretKey: Uint8Array, relays: string[]): NostrEvent {
+  return finalizeEvent(
+    {
+      kind: 10050,
+      created_at: 1_700_000_000,
+      content: "",
+      tags: relays.map((relay) => ["relay", relay]),
+    },
+    secretKey,
+  );
+}
 
 function createMockRelay(): {
   onclose: (() => void) | null;
@@ -55,9 +80,42 @@ function createInboundMessageAt(message: string, botPubkey: string, createdAt: n
   )[1];
 }
 
+function createInboundConcordInvite(botPubkey: string): {
+  wrap: NostrEvent;
+  bundle: ConcordInviteBundle;
+} {
+  const ownerSalt = "11".repeat(32);
+  const communityRoot = "22".repeat(32);
+  const channelId = "33".repeat(32);
+  const channelKey = "44".repeat(32);
+  const bundle: ConcordInviteBundle = {
+    community_id: computeConcordCommunityId(SENDER_PUBKEY, ownerSalt),
+    owner: SENDER_PUBKEY,
+    owner_salt: ownerSalt,
+    community_root: communityRoot,
+    root_epoch: 1,
+    control_pk: "55".repeat(32),
+    channels: [{ id: channelId, key: channelKey, epoch: 1, name: "general" }],
+    relays: [TEST_RELAYS[0]],
+    name: "Test community",
+  };
+  const copies = nip59.wrapManyEvents(
+    {
+      kind: 3313,
+      created_at: Math.floor(Date.now() / 1_000),
+      tags: [],
+      content: JSON.stringify(bundle),
+    },
+    SENDER_SECRET,
+    [botPubkey],
+  );
+  return { wrap: copies[1], bundle };
+}
+
 function emitSubscriptionEvent(callIndex: number, event: NostrEvent): void {
   const params = relayPoolMocks.subscribe.mock.calls[callIndex]?.[1] as
-    { onevent?: (received: NostrEvent) => void } | undefined;
+    | { onevent?: (received: NostrEvent) => void }
+    | undefined;
   params?.onevent?.(event);
 }
 
@@ -71,6 +129,264 @@ beforeEach(() => {
 });
 
 describe("NostrCommunityBot", () => {
+  it("sends proactive NIP-17 recipient and sender copies through declared DM relays", async () => {
+    const botRelayList = createDmRelayList(BOT_SECRET, [TEST_RELAYS[0]]);
+    const recipientRelayList = createDmRelayList(SENDER_SECRET, [TEST_RELAYS[1]]);
+    relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
+    relayPoolMocks.subscribe.mockImplementation((filters, params) => {
+      if (filters[0]?.kinds?.includes(10050)) {
+        const author = filters[0].authors?.[0];
+        queueMicrotask(() => {
+          if (author === botRelayList.pubkey) params.onevent?.(botRelayList);
+          if (author === recipientRelayList.pubkey) params.onevent?.(recipientRelayList);
+          params.oneose?.();
+        });
+      }
+      return { close: vi.fn() };
+    });
+    const bot = new NostrCommunityBot({
+      nsec: TEST_SECRET_HEX,
+      relays: TEST_RELAYS,
+      resolveHostname: async () => ["93.184.216.34"],
+    });
+    await bot.start();
+
+    await bot.sendDirectMessage(SENDER_PUBKEY, "Subscription expires soon");
+
+    expect(relayPoolMocks.publish).toHaveBeenCalledTimes(2);
+    const senderCopy = relayPoolMocks.publish.mock.calls[0][0] as NostrEvent;
+    const recipientCopy = relayPoolMocks.publish.mock.calls[1][0] as NostrEvent;
+    const senderRumor = nip59.unwrapEvent(senderCopy, BOT_SECRET);
+    const recipientRumor = unwrapDirectMessage(recipientCopy, SENDER_SECRET, SENDER_PUBKEY);
+    expect(senderRumor.id).toBe(recipientRumor.id);
+    expect(recipientRumor.content).toBe("Subscription expires soon");
+  });
+
+  it("does not publish a proactive DM without both kind 10050 relay lists", async () => {
+    const botRelayList = createDmRelayList(BOT_SECRET, [TEST_RELAYS[0]]);
+    relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
+    relayPoolMocks.subscribe.mockImplementation((filters, params) => {
+      if (filters[0]?.kinds?.includes(10050)) {
+        queueMicrotask(() => {
+          if (filters[0].authors?.[0] === botRelayList.pubkey) {
+            params.onevent?.(botRelayList);
+          }
+          params.oneose?.();
+        });
+      }
+      return { close: vi.fn() };
+    });
+    const bot = new NostrCommunityBot({
+      nsec: TEST_SECRET_HEX,
+      relays: TEST_RELAYS,
+      resolveHostname: async () => ["93.184.216.34"],
+    });
+    await bot.start();
+
+    await expect(
+      bot.sendDirectMessage(SENDER_PUBKEY, "Subscription expires soon"),
+    ).rejects.toThrow("Nostr direct message recipient is not ready");
+    expect(relayPoolMocks.publish).not.toHaveBeenCalled();
+  });
+
+  it("rejects private recipient relay destinations before publishing", async () => {
+    const botRelayList = createDmRelayList(BOT_SECRET, [TEST_RELAYS[0]]);
+    const recipientRelayList = createDmRelayList(SENDER_SECRET, ["wss://127.0.0.1"]);
+    relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
+    relayPoolMocks.subscribe.mockImplementation((filters, params) => {
+      if (filters[0]?.kinds?.includes(10050)) {
+        queueMicrotask(() => {
+          if (filters[0].authors?.[0] === botRelayList.pubkey) params.onevent?.(botRelayList);
+          if (filters[0].authors?.[0] === recipientRelayList.pubkey) {
+            params.onevent?.(recipientRelayList);
+          }
+          params.oneose?.();
+        });
+      }
+      return { close: vi.fn() };
+    });
+    const bot = new NostrCommunityBot({
+      nsec: TEST_SECRET_HEX,
+      relays: TEST_RELAYS,
+      resolveHostname: async () => ["93.184.216.34"],
+    });
+    await bot.start();
+
+    await expect(bot.sendDirectMessage(SENDER_PUBKEY, "secret alert")).rejects.toThrow(
+      "Nostr direct message recipient is not ready",
+    );
+    expect(relayPoolMocks.publish).not.toHaveBeenCalled();
+  });
+
+  it("does not publish the customer copy when the sender copy fails", async () => {
+    const botRelayList = createDmRelayList(BOT_SECRET, [TEST_RELAYS[0]]);
+    const recipientRelayList = createDmRelayList(SENDER_SECRET, [TEST_RELAYS[1]]);
+    relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
+    relayPoolMocks.publish.mockRejectedValue(new Error("relay leaked failure"));
+    relayPoolMocks.subscribe.mockImplementation((filters, params) => {
+      if (filters[0]?.kinds?.includes(10050)) {
+        queueMicrotask(() => {
+          if (filters[0].authors?.[0] === botRelayList.pubkey) params.onevent?.(botRelayList);
+          if (filters[0].authors?.[0] === recipientRelayList.pubkey) {
+            params.onevent?.(recipientRelayList);
+          }
+          params.oneose?.();
+        });
+      }
+      return { close: vi.fn() };
+    });
+    const bot = new NostrCommunityBot({
+      nsec: TEST_SECRET_HEX,
+      relays: TEST_RELAYS,
+      resolveHostname: async () => ["93.184.216.34"],
+    });
+    await bot.start();
+
+    await expect(bot.sendDirectMessage(SENDER_PUBKEY, "secret alert")).rejects.toThrow(
+      "Relay publication failed",
+    );
+    expect(relayPoolMocks.publish).toHaveBeenCalledTimes(1);
+  });
+
+  it("revalidates cached relay hostnames before reusing them", async () => {
+    const botRelayList = createDmRelayList(BOT_SECRET, [TEST_RELAYS[0]]);
+    const recipientRelayList = createDmRelayList(SENDER_SECRET, [TEST_RELAYS[1]]);
+    relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
+    relayPoolMocks.subscribe.mockImplementation((filters, params) => {
+      if (filters[0]?.kinds?.includes(10050)) {
+        queueMicrotask(() => {
+          if (filters[0].authors?.[0] === botRelayList.pubkey) params.onevent?.(botRelayList);
+          if (filters[0].authors?.[0] === recipientRelayList.pubkey) {
+            params.onevent?.(recipientRelayList);
+          }
+          params.oneose?.();
+        });
+      }
+      return { close: vi.fn() };
+    });
+    const resolveHostname = vi
+      .fn<() => Promise<string[]>>()
+      .mockResolvedValueOnce(["93.184.216.34"])
+      .mockResolvedValueOnce(["93.184.216.34"])
+      .mockResolvedValue(["127.0.0.1"]);
+    const bot = new NostrCommunityBot({
+      nsec: TEST_SECRET_HEX,
+      relays: TEST_RELAYS,
+      resolveHostname,
+    });
+    await bot.start();
+    await bot.sendDirectMessage(SENDER_PUBKEY, "first alert");
+    relayPoolMocks.publish.mockClear();
+
+    await expect(bot.sendDirectMessage(SENDER_PUBKEY, "second alert")).rejects.toThrow(
+      "Nostr direct message recipient is not ready",
+    );
+    expect(resolveHostname).toHaveBeenCalledTimes(4);
+    expect(relayPoolMocks.publish).not.toHaveBeenCalled();
+  });
+
+  it("rejects relay lists that exceed the configured bound", async () => {
+    const excessiveRelays = [
+      "wss://one.example",
+      "wss://two.example",
+      "wss://three.example",
+      "wss://four.example",
+    ];
+    const botRelayList = createDmRelayList(BOT_SECRET, excessiveRelays);
+    const recipientRelayList = createDmRelayList(SENDER_SECRET, [TEST_RELAYS[1]]);
+    relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
+    relayPoolMocks.subscribe.mockImplementation((filters, params) => {
+      if (filters[0]?.kinds?.includes(10050)) {
+        queueMicrotask(() => {
+          if (filters[0].authors?.[0] === botRelayList.pubkey) params.onevent?.(botRelayList);
+          if (filters[0].authors?.[0] === recipientRelayList.pubkey) {
+            params.onevent?.(recipientRelayList);
+          }
+          params.oneose?.();
+        });
+      }
+      return { close: vi.fn() };
+    });
+    const bot = new NostrCommunityBot({
+      nsec: TEST_SECRET_HEX,
+      relays: TEST_RELAYS,
+      resolveHostname: async () => ["93.184.216.34"],
+    });
+    await bot.start();
+
+    await expect(bot.sendDirectMessage(SENDER_PUBKEY, "secret alert")).rejects.toThrow(
+      "Nostr direct message recipient is not ready",
+    );
+    expect(relayPoolMocks.publish).not.toHaveBeenCalled();
+  });
+
+  it("rejects oversized kind 10050 metadata before signature verification", async () => {
+    const oversizedBotRelayList = createDmRelayList(BOT_SECRET, [TEST_RELAYS[0]]);
+    oversizedBotRelayList.tags = Array.from({ length: 65 }, () => [
+      "relay",
+      TEST_RELAYS[0],
+    ]);
+    const recipientRelayList = createDmRelayList(SENDER_SECRET, [TEST_RELAYS[1]]);
+    relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
+    relayPoolMocks.subscribe.mockImplementation((filters, params) => {
+      if (filters[0]?.kinds?.includes(10050)) {
+        queueMicrotask(() => {
+          if (filters[0].authors?.[0] === oversizedBotRelayList.pubkey) {
+            params.onevent?.(oversizedBotRelayList);
+          }
+          if (filters[0].authors?.[0] === recipientRelayList.pubkey) {
+            params.onevent?.(recipientRelayList);
+          }
+          params.oneose?.();
+        });
+      }
+      return { close: vi.fn() };
+    });
+    const bot = new NostrCommunityBot({
+      nsec: TEST_SECRET_HEX,
+      relays: TEST_RELAYS,
+      resolveHostname: async () => ["93.184.216.34"],
+    });
+    await bot.start();
+
+    await expect(bot.sendDirectMessage(SENDER_PUBKEY, "secret alert")).rejects.toThrow(
+      "Nostr direct message recipient is not ready",
+    );
+    expect(relayPoolMocks.publish).not.toHaveBeenCalled();
+  });
+
+  it("rejects structurally malformed relay metadata without exposing parser errors", async () => {
+    const malformedBotRelayList = createDmRelayList(BOT_SECRET, [TEST_RELAYS[0]]);
+    malformedBotRelayList.tags = null as unknown as string[][];
+    const recipientRelayList = createDmRelayList(SENDER_SECRET, [TEST_RELAYS[1]]);
+    relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
+    relayPoolMocks.subscribe.mockImplementation((filters, params) => {
+      if (filters[0]?.kinds?.includes(10050)) {
+        queueMicrotask(() => {
+          if (filters[0].authors?.[0] === malformedBotRelayList.pubkey) {
+            params.onevent?.(malformedBotRelayList);
+          }
+          if (filters[0].authors?.[0] === recipientRelayList.pubkey) {
+            params.onevent?.(recipientRelayList);
+          }
+          params.oneose?.();
+        });
+      }
+      return { close: vi.fn() };
+    });
+    const bot = new NostrCommunityBot({
+      nsec: TEST_SECRET_HEX,
+      relays: TEST_RELAYS,
+      resolveHostname: async () => ["93.184.216.34"],
+    });
+    await bot.start();
+
+    await expect(bot.sendDirectMessage(SENDER_PUBKEY, "secret alert")).rejects.toThrow(
+      "Nostr direct message recipient is not ready",
+    );
+    expect(relayPoolMocks.publish).not.toHaveBeenCalled();
+  });
+
   it("initializes successfully with valid config", () => {
     const bot = new NostrCommunityBot({
       nsec: TEST_SECRET_HEX,
@@ -96,7 +412,7 @@ describe("NostrCommunityBot", () => {
     },
   );
 
-  it("registers and executes commands", async () => {
+  it("registers and executes commands with configurable channel permissions", async () => {
     const bot = new NostrCommunityBot({
       nsec: TEST_SECRET_HEX,
       relays: TEST_RELAYS,
@@ -107,7 +423,17 @@ describe("NostrCommunityBot", () => {
     });
 
     bot.registerCommand("ping", handler);
+    bot.registerCommand("welcome", handler);
+    bot.registerCommand("link", handler);
+    bot.registerCommand("custom-pub", handler, { allowInChannel: true });
+    bot.registerCommand("info", handler, { allowInChannel: false });
+
     expect(bot.getRegisteredCommands()).toContain("ping");
+    expect(bot.isCommandAllowedInChannel("ping")).toBe(true);
+    expect(bot.isCommandAllowedInChannel("welcome")).toBe(true);
+    expect(bot.isCommandAllowedInChannel("link")).toBe(false);
+    expect(bot.isCommandAllowedInChannel("custom-pub")).toBe(true);
+    expect(bot.isCommandAllowedInChannel("info")).toBe(false);
 
     const replyFn = vi.fn();
     const handled = await bot.processMessage(
@@ -388,6 +714,7 @@ describe("NostrCommunityBot", () => {
         args: ["node-id"],
         senderPubkey: SENDER_PUBKEY,
         eventId: expectedRumor.id,
+        transport: "dm",
         reply: expect.any(Function),
       }),
     );
@@ -543,5 +870,135 @@ describe("NostrCommunityBot", () => {
     const second = relayPoolMocks.publish.mock.calls[2][0] as NostrEvent;
     expect(first.id).not.toBe(second.id);
     expect(first.pubkey).not.toBe(second.pubkey);
+  });
+
+  it("keeps Concord invites inert unless explicitly enabled", async () => {
+    relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
+    const bot = new NostrCommunityBot({ nsec: TEST_SECRET_HEX, relays: TEST_RELAYS });
+    await bot.start();
+
+    emitSubscriptionEvent(0, createInboundConcordInvite(bot.getPublicKeyHex()).wrap);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(relayPoolMocks.publish).not.toHaveBeenCalled();
+    expect(relayPoolMocks.subscribe).toHaveBeenCalledTimes(TEST_RELAYS.length);
+  });
+
+  it("accepts Concord direct invites and dispatches public channel commands", async () => {
+    relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
+    const bot = new NostrCommunityBot({
+      nsec: TEST_SECRET_HEX,
+      relays: TEST_RELAYS,
+      concord: { enabled: true },
+    });
+    const handler = vi.fn(async (context) => context.reply("Pong in channel"));
+    bot.registerCommand("ping", handler);
+    await bot.start();
+    const { wrap, bundle } = createInboundConcordInvite(bot.getPublicKeyHex());
+
+    emitSubscriptionEvent(0, wrap);
+    await vi.waitFor(() => expect(relayPoolMocks.publish).toHaveBeenCalledTimes(1));
+
+    const channel = bundle.channels[0];
+    const group = deriveConcordGroupKey(
+      "concord/channel",
+      Buffer.from(channel.key, "hex"),
+      Buffer.from(channel.id, "hex"),
+      channel.epoch,
+    );
+    const subscriptionCall = relayPoolMocks.subscribe.mock.calls.find(
+      ([filters]) => filters[0]?.authors?.[0] === group.publicKey,
+    );
+    expect(subscriptionCall).toBeDefined();
+    const channelEvent = createConcordStreamEvent(SENDER_SECRET, group, {
+      kind: 9,
+      content: "/ping node",
+      tags: [["channel", channel.id], ["epoch", String(channel.epoch)]],
+      created_at: Math.floor(Date.now() / 1_000),
+    });
+    subscriptionCall?.[1].onevent?.(channelEvent);
+
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+    expect(handler).toHaveBeenCalledWith(
+      expect.objectContaining({
+        command: "ping",
+        args: ["node"],
+        transport: "concord-channel",
+        communityId: bundle.community_id,
+        channelId: channel.id,
+        channelName: "general",
+        isModerator: true,
+      }),
+    );
+    await vi.waitFor(() => expect(relayPoolMocks.publish).toHaveBeenCalledTimes(2));
+    const response = relayPoolMocks.publish.mock.calls[1][0] as NostrEvent;
+    expect(
+      decodeConcordStreamEvent(response, group, {
+        channelId: channel.id,
+        epoch: channel.epoch,
+        allowedKinds: [9],
+      })?.rumor.content,
+    ).toBe("Pong in channel");
+  });
+
+  it("wires onMemberJoin, onChannelMention, and publishConcordChannelMessage through NostrCommunityBot", async () => {
+    relayPoolMocks.ensureRelay.mockImplementation(async () => createMockRelay());
+    const bot = new NostrCommunityBot({
+      nsec: TEST_SECRET_HEX,
+      relays: TEST_RELAYS,
+      concord: { enabled: true },
+    });
+    const joinHandler = vi.fn(async (ctx) => {
+      await ctx.replyChannel(`Welcome nostr:${ctx.memberNpub}`);
+    });
+    const mentionHandler = vi.fn(async (ctx) => {
+      await ctx.reply(`Help for nostr:${ctx.senderNpub}`);
+    });
+    bot.onMemberJoin(joinHandler).onChannelMention(mentionHandler);
+    await bot.start();
+
+    const { wrap, bundle } = createInboundConcordInvite(bot.getPublicKeyHex());
+    emitSubscriptionEvent(0, wrap);
+    await vi.waitFor(() => expect(relayPoolMocks.publish).toHaveBeenCalledTimes(1));
+
+    const guestbook = deriveConcordGroupKey(
+      "concord/guestbook",
+      Buffer.from(bundle.community_root, "hex"),
+      Buffer.from(bundle.community_id, "hex"),
+      bundle.root_epoch,
+    );
+    const guestbookSub = relayPoolMocks.subscribe.mock.calls.find(
+      ([filters]) => filters[0]?.authors?.[0] === guestbook.publicKey,
+    );
+    const joinEvent = createConcordStreamEvent(SENDER_SECRET, guestbook, {
+      kind: CONCORD_JOIN_KIND,
+      content: "join",
+      tags: [["ms", "10"]],
+      created_at: Math.floor(Date.now() / 1_000),
+    });
+    guestbookSub?.[1].onevent?.(joinEvent);
+    await vi.waitFor(() => expect(joinHandler).toHaveBeenCalledTimes(1));
+
+    const channel = bundle.channels[0];
+    const channelGroup = deriveConcordGroupKey(
+      "concord/channel",
+      Buffer.from(channel.key, "hex"),
+      Buffer.from(channel.id, "hex"),
+      channel.epoch,
+    );
+    const channelSub = relayPoolMocks.subscribe.mock.calls.find(
+      ([filters]) => filters[0]?.authors?.[0] === channelGroup.publicKey,
+    );
+    const mentionEvent = createConcordStreamEvent(SENDER_SECRET, channelGroup, {
+      kind: 9,
+      content: "Hello @TunnelSats",
+      tags: [["channel", channel.id], ["epoch", String(channel.epoch)]],
+      created_at: Math.floor(Date.now() / 1_000),
+    });
+    channelSub?.[1].onevent?.(mentionEvent);
+    await vi.waitFor(() => expect(mentionHandler).toHaveBeenCalledTimes(1));
+
+    await bot.publishConcordChannelMessage("default", "general", "Proactive announcement");
+    expect(relayPoolMocks.publish).toHaveBeenCalledTimes(4);
   });
 });

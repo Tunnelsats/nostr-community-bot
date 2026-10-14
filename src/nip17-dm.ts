@@ -1,16 +1,40 @@
-import { nip17, nip44 } from "nostr-tools";
-import { getEventHash, verifyEvent, type NostrEvent, type UnsignedEvent } from "nostr-tools/pure";
+import { nip17, nip44, nip59 } from "nostr-tools";
+import {
+  getEventHash,
+  getPublicKey,
+  verifyEvent,
+  type NostrEvent,
+  type UnsignedEvent,
+} from "nostr-tools/pure";
 
 export const MAX_ENCRYPTED_CONTENT_LENGTH = 256 * 1024;
 
 const INVALID_DIRECT_MESSAGE = "Invalid NIP-17 direct message";
+const INVALID_DIRECT_INVITE = "Invalid Concord direct invite";
 const INVALID_REPLY = "Invalid NIP-17 reply";
+const INVALID_OUTPUT = "Invalid NIP-17 direct message output";
 const HEX_32_BYTES = /^[0-9a-f]{64}$/;
 const HEX_64_BYTES = /^[0-9a-f]{128}$/;
+const MAX_DIRECT_MESSAGE_LENGTH = 4_096;
 
 export interface DirectMessageRumor extends UnsignedEvent {
   id: string;
   kind: 14;
+}
+
+export interface DirectInviteRumor extends UnsignedEvent {
+  id: string;
+  kind: 3313;
+}
+
+type DecryptedPrivateRumor = Omit<UnsignedEvent, "kind"> & {
+  id?: string;
+  kind: 14 | 3313;
+};
+
+export interface DirectMessageCopies {
+  sender: NostrEvent;
+  recipient: NostrEvent;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -55,20 +79,21 @@ function verifySignedEvent(event: NostrEvent): boolean {
   });
 }
 
-function isRumor(value: unknown): value is DirectMessageRumor {
+function isRumor(value: unknown, kind: 14 | 3313): value is DecryptedPrivateRumor {
   if (!isRecord(value) || Object.hasOwn(value, "sig")) {
     return false;
   }
 
   return (
-    value.kind === 14 &&
+    value.kind === kind &&
     Number.isInteger(value.created_at) &&
     typeof value.content === "string" &&
     isTags(value.tags) &&
     typeof value.pubkey === "string" &&
     HEX_32_BYTES.test(value.pubkey) &&
-    typeof value.id === "string" &&
-    HEX_32_BYTES.test(value.id)
+    (kind === 3313 && value.id === undefined
+      ? true
+      : typeof value.id === "string" && HEX_32_BYTES.test(value.id))
   );
 }
 
@@ -96,6 +121,36 @@ export function unwrapDirectMessage(
   recipientSecretKey: Uint8Array,
   recipientPubkey: string,
 ): DirectMessageRumor {
+  return unwrapPrivateRumor(
+    wrap,
+    recipientSecretKey,
+    recipientPubkey,
+    14,
+    INVALID_DIRECT_MESSAGE,
+  ) as DirectMessageRumor;
+}
+
+export function unwrapDirectInvite(
+  wrap: NostrEvent,
+  recipientSecretKey: Uint8Array,
+  recipientPubkey: string,
+): DirectInviteRumor {
+  return unwrapPrivateRumor(
+    wrap,
+    recipientSecretKey,
+    recipientPubkey,
+    3313,
+    INVALID_DIRECT_INVITE,
+  ) as DirectInviteRumor;
+}
+
+function unwrapPrivateRumor(
+  wrap: NostrEvent,
+  recipientSecretKey: Uint8Array,
+  recipientPubkey: string,
+  rumorKind: 14 | 3313,
+  failureMessage: string,
+): DirectMessageRumor | DirectInviteRumor {
   try {
     if (
       recipientSecretKey.length !== 32 ||
@@ -120,25 +175,28 @@ export function unwrapDirectMessage(
     }
 
     const rumorValue = decryptJson(sealValue.content, recipientSecretKey, sealValue.pubkey);
+    const rumorId = isRumor(rumorValue, rumorKind) ? getEventHash(rumorValue) : "";
     if (
-      !isRumor(rumorValue) ||
+      !isRumor(rumorValue, rumorKind) ||
       rumorValue.pubkey !== sealValue.pubkey ||
-      !hasSingleRecipient(rumorValue.tags, recipientPubkey) ||
-      rumorValue.id !== getEventHash(rumorValue)
+      (rumorKind === 14
+        ? !hasSingleRecipient(rumorValue.tags, recipientPubkey)
+        : rumorValue.tags.length !== 0) ||
+      (rumorValue.id !== undefined && rumorValue.id !== rumorId)
     ) {
       throw new Error(INVALID_DIRECT_MESSAGE);
     }
 
     return {
-      id: rumorValue.id,
+      id: rumorId,
       pubkey: rumorValue.pubkey,
       created_at: rumorValue.created_at,
-      kind: 14,
+      kind: rumorKind,
       tags: rumorValue.tags.map((tag) => [...tag]),
       content: rumorValue.content,
     };
   } catch {
-    throw new Error(INVALID_DIRECT_MESSAGE);
+    throw new Error(failureMessage);
   }
 }
 
@@ -163,5 +221,42 @@ export function createDirectMessageReply(
     });
   } catch {
     throw new Error(INVALID_REPLY);
+  }
+}
+
+export function createDirectMessage(
+  senderSecretKey: Uint8Array,
+  recipientPubkey: string,
+  message: string,
+): DirectMessageCopies {
+  try {
+    if (
+      senderSecretKey.length !== 32 ||
+      !HEX_32_BYTES.test(recipientPubkey) ||
+      typeof message !== "string" ||
+      message.length === 0 ||
+      message.length > MAX_DIRECT_MESSAGE_LENGTH
+    ) {
+      throw new Error(INVALID_OUTPUT);
+    }
+
+    const event: Partial<UnsignedEvent> = {
+      kind: 14,
+      created_at: Math.floor(Date.now() / 1_000),
+      tags: [["p", recipientPubkey]],
+      content: message,
+    };
+    const [sender, recipient] = nip59.wrapManyEvents(event, senderSecretKey, [recipientPubkey]);
+    if (
+      !sender ||
+      !recipient ||
+      sender.tags[0]?.[1] !== getPublicKey(senderSecretKey) ||
+      recipient.tags[0]?.[1] !== recipientPubkey
+    ) {
+      throw new Error(INVALID_OUTPUT);
+    }
+    return { sender, recipient };
+  } catch {
+    throw new Error(INVALID_OUTPUT);
   }
 }
