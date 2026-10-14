@@ -245,6 +245,7 @@ export class NostrCommunityBot {
     const ctx: CommandContext = {
       command: parsed.command,
       args: parsed.args,
+      rawText: text,
       senderPubkey,
       eventId,
       reply: defaultReply,

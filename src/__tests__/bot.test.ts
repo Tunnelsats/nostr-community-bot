@@ -1210,4 +1210,20 @@ describe("NostrCommunityBot", () => {
       }),
     );
   });
+
+  it("preserves rawText with multiline newlines in CommandContext", async () => {
+    const bot = new NostrCommunityBot({ nsec: TEST_SECRET_HEX, relays: TEST_RELAYS });
+    const handler = vi.fn();
+    bot.registerCommand("setwelcome", handler);
+
+    const multilineText = "/setwelcome channel Line 1\n\nLine 2\n- Bullet A\n- Bullet B";
+    await bot.processMessage(multilineText, SENDER_PUBKEY, "event-multiline");
+
+    expect(handler).toHaveBeenCalledWith(
+      expect.objectContaining({
+        command: "setwelcome",
+        rawText: multilineText,
+      }),
+    );
+  });
 });
