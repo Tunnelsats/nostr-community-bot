@@ -87,6 +87,7 @@ export interface ConcordConfig {
   enabled: boolean;
   store?: ConcordCommunityStore;
   defaultChannelId?: string;
+  channelReadyTimeoutMs?: number;
   onMemberJoin?: ConcordMemberJoinHandler;
   onChannelMention?: ConcordChannelMentionHandler;
 }
