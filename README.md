@@ -97,7 +97,7 @@ const bot = new NostrCommunityBot({
 
 ### Armada Concord V2 Communities
 
-Enable `concord` in `NostrBotConfig` to accept `kind:3313` direct invites, persist joined communities across restarts via `ConcordCommunityStore`, welcome new members on `kind:3306` guestbook joins, respond to `@Bot` channel mentions, and publish proactive channel updates:
+Enable `concord` in `NostrBotConfig` to accept `kind:3313` direct invites (including subsequent re-invites that add private channels or rotate channel/community epochs), persist joined communities across restarts via `ConcordCommunityStore`, welcome new members on `kind:3306` guestbook joins, respond to `@Bot` channel mentions, and publish proactive channel updates:
 
 ```typescript
 import {
@@ -117,6 +117,11 @@ const bot = new NostrCommunityBot({
     enabled: true,
     store: communityStore,
     defaultChannelId: "general",
+    channelReadyTimeoutMs: 1500, // Wait window for async Control stream channel folding on startup
+    allowedCommunityIds: [
+      "7db995b3dff87ba5c4348007834cc0f98ef0abb6f761e0aac17bfea4b90593ca",
+    ],
+    allowedInviterPubkeys: ["npub1..."],
   },
 });
 
@@ -130,11 +135,19 @@ bot.onChannelMention(async (ctx) => {
 
 await bot.start();
 
-// Publish a proactive message to a Concord channel:
+// Publish a proactive message to a public or invited private Concord channel (by channel ID or name):
 await bot.publishConcordChannelMessage("default", "general", "Scheduled status update");
+await bot.publishConcordChannelMessage(
+  "7db995b3dff87ba5c4348007834cc0f98ef0abb6f761e0aac17bfea4b90593ca",
+  "0daff3a90287ce6bef9a4f372aaa7b5689178ad5ec47c1647df22169b42cb314",
+  "Operational notification in private Notifications channel",
+);
 ```
 
-When Concord is enabled, both channel commands and NIP-17 DM commands receive `ctx.senderRole` (`"owner" | "admin" | "moderator" | "member"`) and `ctx.isModerator` resolved from the folded `kind:3308` control stream (for DMs, resolved against the community's target channel such as `defaultChannelId`).
+- **Invite Sender & Community Allow-List Enforcement**: `kind:3313` direct invites are accepted only for communities matching `allowedCommunityIds` (when configured) and only when the NIP-59 `kind:13` seal / rumor author (`rumor.pubkey`) is the verified community `owner`, an entry in `allowedInviterPubkeys`, or a folded community `admin` (`existing.control.roleFor(rumor.pubkey)`). Unprivileged community members and foreign communities cannot invite the bot or inject/rotate private channel keys.
+- **Private Channel Isolation**: Invite-only private channels (`bundle.channels` with `source: "invite"` or `private: true` in the `kind:3308` Control stream, such as a dedicated `"Notifications"` channel) are isolated from public channel fallbacks (`resolveDefaultChannel` and `publishConcordChannelMessage("...", "general", ...)` never fall back to a private channel while `#general` is folding on startup).
+- **Direct Re-Invite Merging & Epoch Rotation**: Receiving an updated `kind:3313` direct invite for an already-joined community merges newly invited private channels and relays, rotates channel keys/epochs and community `root_epoch`/`community_root` when incremented, disposes superseded subscriptions, and persists the updated bundle via `ConcordCommunityStore.saveCommunity`.
+- **Role Resolution**: When Concord is enabled, both channel commands and NIP-17 DM commands receive `ctx.senderRole` (`"owner" | "admin" | "moderator" | "member"`) and `ctx.isModerator` resolved from the folded `kind:3308` control stream (for DMs, resolved against the community's target channel such as `defaultChannelId`).
 
 ### Proactive NIP-17 Direct Messages
 

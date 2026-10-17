@@ -289,6 +289,9 @@ export class NostrCommunityBot {
             this.sendDirectMessage(recipientPubkey, message),
           store: config.concord.store,
           defaultChannelId: config.concord.defaultChannelId,
+          channelReadyTimeoutMs: config.concord.channelReadyTimeoutMs,
+          allowedCommunityIds: config.concord.allowedCommunityIds,
+          allowedInviterPubkeys: config.concord.allowedInviterPubkeys,
           onMemberJoin: config.concord.onMemberJoin,
           onChannelMention: config.concord.onChannelMention,
         })
@@ -537,6 +540,7 @@ export class NostrCommunityBot {
     channelId: string,
     message: string,
     extraTags?: string[][],
+    options?: { waitTimeoutMs?: number },
   ): Promise<void> {
     if (!this.acceptingRelayEvents || !this.concordManager) {
       throw new Error("Concord community manager is not running");
@@ -546,6 +550,7 @@ export class NostrCommunityBot {
       channelId,
       message,
       extraTags,
+      options,
     );
   }
 

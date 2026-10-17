@@ -87,6 +87,11 @@ export interface ConcordConfig {
   enabled: boolean;
   store?: ConcordCommunityStore;
   defaultChannelId?: string;
+  channelReadyTimeoutMs?: number;
+  /** Optional allow-list of 64-char hex Concord community IDs the bot is permitted to join or restore. */
+  allowedCommunityIds?: string[];
+  /** Optional allow-list of admin/inviter pubkeys (64-char hex or npub1...) authorized to send Kind 3313 direct invites. */
+  allowedInviterPubkeys?: string[];
   onMemberJoin?: ConcordMemberJoinHandler;
   onChannelMention?: ConcordChannelMentionHandler;
 }

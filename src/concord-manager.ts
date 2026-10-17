@@ -88,6 +88,9 @@ interface ConcordCommunityManagerOptions {
   sendDirectMessage?: (recipientPubkey: string, message: string) => Promise<void>;
   store?: ConcordCommunityStore;
   defaultChannelId?: string;
+  channelReadyTimeoutMs?: number;
+  allowedCommunityIds?: string[];
+  allowedInviterPubkeys?: string[];
   onMemberJoin?: ConcordMemberJoinHandler;
   onChannelMention?: ConcordChannelMentionHandler;
   now?: () => number;
@@ -120,6 +123,46 @@ function emptyControl(bundle: ConcordInviteBundle): FoldedConcordControl {
     communityId: bundle.community_id,
     owner: bundle.owner,
   });
+}
+
+function normalizeCommunityIdSet(entries?: string[]): Set<string> {
+  const result = new Set<string>();
+  if (!entries) return result;
+  for (const raw of entries) {
+    const trimmed = raw.trim().toLowerCase();
+    if (/^[0-9a-f]{64}$/.test(trimmed)) {
+      result.add(trimmed);
+    }
+  }
+  return result;
+}
+
+function normalizePubkeySet(entries?: string[]): Set<string> {
+  const result = new Set<string>();
+  if (!entries) return result;
+  for (const raw of entries) {
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+      result.add(trimmed.toLowerCase());
+      continue;
+    }
+    if (trimmed.toLowerCase().startsWith("npub1")) {
+      try {
+        const decoded = nip19.decode(trimmed);
+        if (
+          decoded.type === "npub" &&
+          typeof decoded.data === "string" &&
+          /^[0-9a-fA-F]{64}$/.test(decoded.data)
+        ) {
+          result.add(decoded.data.toLowerCase());
+        }
+      } catch {
+        // Ignore malformed npub entries
+      }
+    }
+  }
+  return result;
 }
 
 function tagValue(tags: string[][], name: string): string | undefined {
@@ -172,6 +215,9 @@ export class ConcordCommunityManager {
   ) => Promise<void>;
   private readonly store?: ConcordCommunityStore;
   private readonly defaultChannelId?: string;
+  private readonly channelReadyTimeoutMs: number;
+  private readonly allowedCommunityIds: Set<string>;
+  private readonly allowedInviterPubkeys: Set<string>;
   private onMemberJoinHandler?: ConcordMemberJoinHandler;
   private onChannelMentionHandler?: ConcordChannelMentionHandler;
   private readonly now: () => number;
@@ -179,6 +225,7 @@ export class ConcordCommunityManager {
   private readonly processedWraps = new Set<string>();
   private readonly processedRumors = new Set<string>();
   private readonly acceptedInvites = new Set<string>();
+  private readonly channelWaiters = new Set<() => void>();
   private inviteQueue: Promise<void> = Promise.resolve();
   private accepting = true;
 
@@ -196,6 +243,9 @@ export class ConcordCommunityManager {
     this.sendDirectMessage = options.sendDirectMessage;
     this.store = options.store;
     this.defaultChannelId = options.defaultChannelId;
+    this.channelReadyTimeoutMs = options.channelReadyTimeoutMs ?? 1_500;
+    this.allowedCommunityIds = normalizeCommunityIdSet(options.allowedCommunityIds);
+    this.allowedInviterPubkeys = normalizePubkeySet(options.allowedInviterPubkeys);
     this.onMemberJoinHandler = options.onMemberJoin;
     this.onChannelMentionHandler = options.onChannelMention;
     this.now = options.now ?? Date.now;
@@ -209,6 +259,33 @@ export class ConcordCommunityManager {
     this.onChannelMentionHandler = handler;
   }
 
+  private isCommunityAllowed(communityId: string): boolean {
+    if (this.allowedCommunityIds.size === 0) return true;
+    return this.allowedCommunityIds.has(communityId.toLowerCase());
+  }
+
+  private isInviteSenderAuthorized(
+    senderPubkey: string,
+    bundle: ConcordInviteBundle,
+    existing?: CommunityState,
+  ): boolean {
+    const sender = senderPubkey.trim().toLowerCase();
+    if (this.allowedInviterPubkeys.has(sender)) {
+      return true;
+    }
+    if (existing) {
+      if (sender === existing.bundle.owner.toLowerCase()) {
+        return true;
+      }
+      const role = existing.control.roleFor(sender);
+      return role === "owner" || role === "admin";
+    }
+    if (this.allowedInviterPubkeys.size > 0 && this.allowedCommunityIds.size === 0) {
+      return false;
+    }
+    return sender === bundle.owner.toLowerCase();
+  }
+
   public async restoreCommunities(): Promise<void> {
     this.accepting = true;
     if (!this.store) return;
@@ -217,6 +294,7 @@ export class ConcordCommunityManager {
       if (!this.accepting) return;
       const bundle = validateConcordInvite(persisted.bundle, 0);
       if (!bundle) continue;
+      if (!this.isCommunityAllowed(bundle.community_id)) continue;
       if (this.communities.has(bundle.community_id)) continue;
       if (this.communities.size >= MAX_COMMUNITIES) break;
       if (
@@ -270,14 +348,28 @@ export class ConcordCommunityManager {
       console.warn(`[Concord] Direct invite validation failed for rumor ${rumor.id.slice(0, 8)}...`);
       return;
     }
-    console.log(`[Concord] Accepted direct invite for community ${bundle.community_id.slice(0, 8)}... with ${bundle.channels.length} channel(s) across ${bundle.relays.length} relay(s)`);
+    if (!this.isCommunityAllowed(bundle.community_id)) {
+      console.warn(
+        `[Concord] Rejected direct invite for non-allowlisted community ${bundle.community_id.slice(0, 8)}... from ${rumor.pubkey.slice(0, 8)}...`,
+      );
+      return;
+    }
     const existing = this.communities.get(bundle.community_id);
+    if (!this.isInviteSenderAuthorized(rumor.pubkey, bundle, existing)) {
+      console.warn(
+        `[Concord] Rejected direct invite for community ${bundle.community_id.slice(0, 8)}... from unauthorized sender ${rumor.pubkey.slice(0, 8)}...`,
+      );
+      return;
+    }
+    console.log(`[Concord] Accepted direct invite for community ${bundle.community_id.slice(0, 8)}... with ${bundle.channels.length} channel(s) across ${bundle.relays.length} relay(s)`);
     if (existing) {
       if (
-        existing.bundle.root_epoch !== bundle.root_epoch ||
-        existing.bundle.community_root !== bundle.community_root ||
-        existing.bundle.control_pk !== bundle.control_pk
+        existing.bundle.control_pk !== bundle.control_pk ||
+        existing.bundle.owner !== bundle.owner
       ) {
+        return;
+      }
+      if (bundle.root_epoch < existing.bundle.root_epoch) {
         return;
       }
       const newChannels = bundle.channels.filter(
@@ -292,9 +384,62 @@ export class ConcordCommunityManager {
       await this.relayTransport.addRelays(bundle.relays);
       console.log(`[Concord] Community relay registration completed for ${bundle.relays.length} relay(s)`);
       if (!this.accepting) return;
+
+      if (
+        bundle.root_epoch > existing.bundle.root_epoch ||
+        bundle.community_root !== existing.bundle.community_root
+      ) {
+        existing.bundle.root_epoch = bundle.root_epoch;
+        existing.bundle.community_root = bundle.community_root;
+        const controlRead = deriveConcordGroupKey(
+          "concord/control",
+          Buffer.from(bundle.community_root, "hex"),
+          Buffer.from(bundle.community_id, "hex"),
+          bundle.root_epoch,
+        );
+        existing.controlReadGroup = {
+          ...controlRead,
+          publicKey: bundle.control_pk,
+        };
+        const guestbookGroup = deriveConcordGroupKey(
+          "concord/guestbook",
+          Buffer.from(bundle.community_root, "hex"),
+          Buffer.from(bundle.community_id, "hex"),
+          bundle.root_epoch,
+        );
+        existing.guestbookDispose();
+        existing.guestbookGroup = guestbookGroup;
+        existing.guestbookDispose = this.relayTransport.registerSubscription(
+          {
+            kinds: [CONCORD_STREAM_KIND, CONCORD_EPHEMERAL_STREAM_KIND],
+            authors: [guestbookGroup.publicKey],
+          },
+          (event) => this.handleGuestbookEvent(existing, event),
+        );
+        for (const context of [...existing.channels.values()]) {
+          if (context.active && context.source === "public") {
+            this.subscribeChannel(
+              existing,
+              context.channelId,
+              existing.bundle.root_epoch,
+              Buffer.from(existing.bundle.community_root, "hex"),
+              "public",
+              context.name,
+            );
+          }
+        }
+      }
+
+      for (const relay of bundle.relays) {
+        if (!existing.bundle.relays.includes(relay)) {
+          existing.bundle.relays.push(relay);
+        }
+      }
+
       for (const channel of bundle.channels) {
-        if (!existing.bundle.channels.some((held) => held.id === channel.id)) {
-          existing.bundle.channels.push(channel);
+        const held = existing.bundle.channels.find((c) => c.id === channel.id);
+        if (!held) {
+          existing.bundle.channels.push({ ...channel });
           this.subscribeChannel(
             existing,
             channel.id,
@@ -303,10 +448,41 @@ export class ConcordCommunityManager {
             "invite",
             channel.name,
           );
+        } else if (
+          channel.epoch > held.epoch ||
+          (channel.epoch === held.epoch && channel.key !== held.key) ||
+          (!held.name && channel.name)
+        ) {
+          held.key = channel.key;
+          held.epoch = channel.epoch;
+          if (channel.name) {
+            held.name = channel.name;
+          }
+          this.subscribeChannel(
+            existing,
+            channel.id,
+            channel.epoch,
+            Buffer.from(channel.key, "hex"),
+            "invite",
+            held.name,
+          );
+        } else if (
+          ![...existing.channels.values()].some(
+            (ch) => ch.active && ch.channelId === channel.id,
+          )
+        ) {
+          this.subscribeChannel(
+            existing,
+            held.id,
+            held.epoch,
+            Buffer.from(held.key, "hex"),
+            "invite",
+            held.name,
+          );
         }
       }
       if (!existing.joinPublished) {
-        await this.publishJoin(bundle);
+        await this.publishJoin(existing.bundle);
         existing.joinPublished = true;
       }
       await this.store?.saveCommunity({
@@ -424,6 +600,7 @@ export class ConcordCommunityManager {
     channelId: string,
     message: string,
     extraTags: string[][] = [],
+    options?: { waitTimeoutMs?: number },
   ): Promise<void> {
     if (!this.accepting) {
       throw new Error("Concord community manager is stopped");
@@ -441,21 +618,17 @@ export class ConcordCommunityManager {
       throw new Error("Concord community is not active");
     }
 
-    const activeChannels = [...state.channels.values()].filter((ch) => ch.active);
-    let targetChannel = activeChannels.find((ch) => ch.channelId === channelId);
-    if (!targetChannel) {
-      if (channelId === "default") {
-        targetChannel = this.resolveDefaultChannel(state)?.context;
-      } else {
-        targetChannel = activeChannels.find(
-          (ch) =>
-            this.getChannelName(state, ch.channelId)?.toLowerCase() ===
-            channelId.toLowerCase(),
-        );
-        if (!targetChannel && channelId.toLowerCase() === "general") {
-          targetChannel = this.resolveDefaultChannel(state)?.context;
-        }
-      }
+    const waitTimeoutMs = Math.max(
+      0,
+      options?.waitTimeoutMs ?? this.channelReadyTimeoutMs,
+    );
+    const targetChannel = await this.waitForTargetChannel(
+      state,
+      channelId,
+      waitTimeoutMs,
+    );
+    if (!this.accepting) {
+      throw new Error("Concord community manager is stopped");
     }
     if (!targetChannel) {
       throw new Error("Concord channel is not active");
@@ -497,6 +670,7 @@ export class ConcordCommunityManager {
       const resolvedChannelId =
         matchedChannel?.channelId ??
         this.resolveDefaultChannel(state)?.context.channelId ??
+        activeChannels[0]?.channelId ??
         "";
       const role = state.control.roleFor(memberPubkey, resolvedChannelId);
       if (ROLE_RANK[role] > ROLE_RANK[highestRole]) {
@@ -509,6 +683,7 @@ export class ConcordCommunityManager {
   public stop(): void {
     if (!this.accepting) return;
     this.accepting = false;
+    this.notifyChannelWaiters();
     for (const state of this.communities.values()) {
       state.controlDispose();
       state.guestbookDispose();
@@ -518,6 +693,12 @@ export class ConcordCommunityManager {
     this.processedWraps.clear();
     this.processedRumors.clear();
     this.acceptedInvites.clear();
+  }
+
+  private notifyChannelWaiters(): void {
+    for (const notify of [...this.channelWaiters]) {
+      notify();
+    }
   }
 
   private rememberWrap(eventId: string): boolean {
@@ -565,14 +746,27 @@ export class ConcordCommunityManager {
     source: ChannelContext["source"],
     name?: string,
   ): void {
-    if (this.channelSubscriptionCount() >= MAX_CONCORD_CHANNEL_SUBSCRIPTIONS) return;
     const group = deriveConcordGroupKey(
       "concord/channel",
       channelSecret,
       Buffer.from(channelId, "hex"),
       epoch,
     );
-    if (state.channels.has(group.publicKey)) return;
+    const existingByGroup = state.channels.get(group.publicKey);
+    if (existingByGroup) {
+      if (!existingByGroup.name && name) {
+        existingByGroup.name = name;
+      }
+      this.notifyChannelWaiters();
+      return;
+    }
+    for (const [publicKey, existingContext] of state.channels) {
+      if (existingContext.channelId === channelId) {
+        existingContext.dispose();
+        state.channels.delete(publicKey);
+      }
+    }
+    if (this.channelSubscriptionCount() >= MAX_CONCORD_CHANNEL_SUBSCRIPTIONS) return;
     const context = {} as ChannelContext;
     context.channelId = channelId;
     context.epoch = epoch;
@@ -594,6 +788,7 @@ export class ConcordCommunityManager {
     };
     state.channels.set(group.publicKey, context);
     console.log(`[Concord] Subscribed to ${source} channel ${channelId.slice(0, 8)}... (epoch ${epoch}) with stream pk ${group.publicKey.slice(0, 8)}...`);
+    this.notifyChannelWaiters();
   }
 
   private channelSubscriptionCount(): number {
@@ -617,6 +812,86 @@ export class ConcordCommunityManager {
     return undefined;
   }
 
+  private isPrivateChannel(state: CommunityState, context: ChannelContext): boolean {
+    const definition = state.control.channels.find(
+      (channel) => channel.channelId === context.channelId && !channel.deleted,
+    );
+    if (definition?.private === true) {
+      return true;
+    }
+    return context.source === "invite" && definition?.private !== false;
+  }
+
+  private findTargetChannel(
+    state: CommunityState,
+    channelId: string,
+  ): ChannelContext | undefined {
+    const activeChannels = [...state.channels.values()].filter((ch) => ch.active);
+    const exactMatch = activeChannels.find((ch) => ch.channelId === channelId);
+    if (exactMatch) {
+      return exactMatch;
+    }
+    if (channelId === "default") {
+      return this.resolveDefaultChannel(state)?.context;
+    }
+    const lowerTarget = channelId.toLowerCase();
+    const byName = activeChannels.find((ch) => {
+      if (lowerTarget === "general") {
+        const definition = state.control.channels.find(
+          (channel) => channel.channelId === ch.channelId && !channel.deleted,
+        );
+        if (definition?.private === true) {
+          return false;
+        }
+      }
+      return this.getChannelName(state, ch.channelId)?.toLowerCase() === lowerTarget;
+    });
+    if (byName) {
+      return byName;
+    }
+    if (lowerTarget === "general") {
+      return this.resolveDefaultChannel(state)?.context;
+    }
+    return undefined;
+  }
+
+  private async waitForTargetChannel(
+    state: CommunityState,
+    channelId: string,
+    waitTimeoutMs: number,
+  ): Promise<ChannelContext | undefined> {
+    const immediate = this.findTargetChannel(state, channelId);
+    if (immediate || !this.accepting || waitTimeoutMs <= 0) {
+      return immediate;
+    }
+    return new Promise<ChannelContext | undefined>((resolve) => {
+      let settled = false;
+      const finish = (result: ChannelContext | undefined) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(pollTimer);
+        clearTimeout(timeoutTimer);
+        this.channelWaiters.delete(check);
+        resolve(result);
+      };
+      const check = () => {
+        if (!this.accepting) {
+          finish(undefined);
+          return;
+        }
+        const matched = this.findTargetChannel(state, channelId);
+        if (matched) {
+          finish(matched);
+        }
+      };
+      this.channelWaiters.add(check);
+      const pollTimer = setInterval(check, 50);
+      const timeoutTimer = setTimeout(() => {
+        finish(this.findTargetChannel(state, channelId));
+      }, waitTimeoutMs);
+    });
+  }
+
   private resolveDefaultChannel(
     state: CommunityState,
   ): { context: ChannelContext; name?: string } | undefined {
@@ -625,6 +900,15 @@ export class ConcordCommunityManager {
 
     if (this.defaultChannelId) {
       const configured = activeChannels.find((ch) => {
+        const definition = state.control.channels.find(
+          (channel) => channel.channelId === ch.channelId && !channel.deleted,
+        );
+        if (
+          this.defaultChannelId?.toLowerCase() === "general" &&
+          definition?.private === true
+        ) {
+          return false;
+        }
         const name = this.getChannelName(state, ch.channelId);
         return (
           ch.channelId === this.defaultChannelId ||
@@ -637,11 +921,20 @@ export class ConcordCommunityManager {
           name: this.getChannelName(state, configured.channelId),
         };
       }
+      if (this.defaultChannelId.toLowerCase() !== "general") {
+        return undefined;
+      }
     }
 
-    const general = activeChannels.find(
-      (ch) => this.getChannelName(state, ch.channelId)?.toLowerCase() === "general",
-    );
+    const general = activeChannels.find((ch) => {
+      const definition = state.control.channels.find(
+        (channel) => channel.channelId === ch.channelId && !channel.deleted,
+      );
+      if (definition?.private === true) {
+        return false;
+      }
+      return this.getChannelName(state, ch.channelId)?.toLowerCase() === "general";
+    });
     if (general) {
       return {
         context: general,
@@ -649,10 +942,11 @@ export class ConcordCommunityManager {
       };
     }
 
-    const first = activeChannels[0];
+    const firstPublic = activeChannels.find((ch) => !this.isPrivateChannel(state, ch));
+    if (!firstPublic) return undefined;
     return {
-      context: first,
-      name: this.getChannelName(state, first.channelId),
+      context: firstPublic,
+      name: this.getChannelName(state, firstPublic.channelId),
     };
   }
 
@@ -702,6 +996,7 @@ export class ConcordCommunityManager {
       );
       activeChannelIds.add(channel.channelId);
     }
+    this.notifyChannelWaiters();
   }
 
   private async handleGuestbookEvent(state: CommunityState, event: NostrEvent): Promise<void> {

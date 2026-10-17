@@ -586,7 +586,7 @@ describe("ConcordCommunityManager", () => {
 
     await currentHarness.manager.publishChannelMessage(
       "default",
-      "default",
+      PRIVATE_CHANNEL,
       "Scheduled server status update",
     );
 
@@ -603,6 +603,56 @@ describe("ConcordCommunityManager", () => {
       allowedKinds: [9],
     });
     expect(decoded?.rumor.content).toBe("Scheduled server status update");
+
+    const controlRead = deriveConcordGroupKey(
+      "concord/control",
+      Buffer.from(ROOT, "hex"),
+      Buffer.from(COMMUNITY_ID, "hex"),
+      2,
+    );
+    const controlGroup = {
+      ...controlRead,
+      secretKey: CONTROL_SIGNER_SECRET,
+      publicKey: CONTROL_PK,
+    };
+    await findSubscription(CONTROL_PK).handler(
+      createConcordStreamEvent(
+        OWNER_SECRET,
+        controlGroup,
+        {
+          kind: CONCORD_CONTROL_KIND,
+          content: JSON.stringify({ name: "general", private: false }),
+          tags: [["vsk", "2"], ["eid", PUBLIC_CHANNEL], ["ev", "1"]],
+          created_at: 1_700_000_000,
+        },
+        { sealKind: 20014 },
+      ),
+    );
+    currentHarness.published.length = 0;
+
+    await currentHarness.manager.publishChannelMessage(
+      "default",
+      "default",
+      "Public server status update",
+    );
+
+    expect(currentHarness.published).toHaveLength(1);
+    const publicGroup = deriveConcordGroupKey(
+      "concord/channel",
+      Buffer.from(ROOT, "hex"),
+      Buffer.from(PUBLIC_CHANNEL, "hex"),
+      2,
+    );
+    const publicDecoded = decodeConcordStreamEvent(
+      currentHarness.published[0],
+      publicGroup,
+      {
+        channelId: PUBLIC_CHANNEL,
+        epoch: 2,
+        allowedKinds: [9],
+      },
+    );
+    expect(publicDecoded?.rumor.content).toBe("Public server status update");
   });
 
   it("folds public channels from Control and begins handling #general", async () => {
@@ -1019,5 +1069,613 @@ describe("ConcordCommunityManager", () => {
       logSpy.mockRestore();
     }
   });
+
+  it("prevents resolveDefaultChannel and onMemberJoin from falling back to a private invite channel before #general is folded", async () => {
+    const notificationsChannelId =
+      "0daff3a90287ce6bef9a4f372aaa7b5689178ad5ec47c1647df22169b42cb314";
+    const onMemberJoin = vi.fn();
+    currentHarness.manager.setOnMemberJoin(onMemberJoin);
+
+    await currentHarness.manager.acceptDirectInvite(
+      directInviteRumor({
+        ...bundle(),
+        channels: [
+          {
+            id: notificationsChannelId,
+            key: PRIVATE_KEY,
+            epoch: 1,
+            name: "Notifications",
+          },
+        ],
+      }),
+    );
+    currentHarness.published.length = 0;
+
+    const guestbook = deriveConcordGroupKey(
+      "concord/guestbook",
+      Buffer.from(ROOT, "hex"),
+      Buffer.from(COMMUNITY_ID, "hex"),
+      2,
+    );
+    const guestbookSub = findSubscription(guestbook.publicKey);
+
+    // Join event arrives before Control folds public #general
+    const earlyJoin = createConcordStreamEvent(MEMBER_SECRET, guestbook, {
+      kind: CONCORD_JOIN_KIND,
+      content: "join",
+      tags: [["ms", "100"]],
+      created_at: 1_700_000_010,
+    });
+    await guestbookSub.handler(earlyJoin);
+
+    expect(onMemberJoin).toHaveBeenCalledTimes(1);
+    const earlyCtx = onMemberJoin.mock.calls[0][0];
+    expect(earlyCtx.defaultChannelId).toBeUndefined();
+    expect(earlyCtx.defaultChannelName).toBeUndefined();
+    await expect(earlyCtx.replyChannel("Welcome!")).rejects.toThrow(
+      "No active Concord channel available for welcome message",
+    );
+    expect(currentHarness.published).toHaveLength(0);
+
+    // Now Control folds public #general (private: false) and marks Notifications as private: true
+    const controlRead = deriveConcordGroupKey(
+      "concord/control",
+      Buffer.from(ROOT, "hex"),
+      Buffer.from(COMMUNITY_ID, "hex"),
+      2,
+    );
+    const controlGroup = {
+      ...controlRead,
+      secretKey: CONTROL_SIGNER_SECRET,
+      publicKey: CONTROL_PK,
+    };
+    const controlSub = findSubscription(CONTROL_PK);
+    await controlSub.handler(
+      createConcordStreamEvent(
+        OWNER_SECRET,
+        controlGroup,
+        {
+          kind: CONCORD_CONTROL_KIND,
+          content: JSON.stringify({ name: "Notifications", private: true }),
+          tags: [["vsk", "2"], ["eid", notificationsChannelId], ["ev", "1"]],
+          created_at: 1_700_000_011,
+        },
+        { sealKind: 20014 },
+      ),
+    );
+    await controlSub.handler(
+      createConcordStreamEvent(
+        OWNER_SECRET,
+        controlGroup,
+        {
+          kind: CONCORD_CONTROL_KIND,
+          content: JSON.stringify({ name: "general", private: false }),
+          tags: [["vsk", "2"], ["eid", PUBLIC_CHANNEL], ["ev", "1"]],
+          created_at: 1_700_000_012,
+        },
+        { sealKind: 20014 },
+      ),
+    );
+
+    const secondMemberSecret = generateSecretKey();
+    const secondMember = getPublicKey(secondMemberSecret);
+    const lateJoin = createConcordStreamEvent(secondMemberSecret, guestbook, {
+      kind: CONCORD_JOIN_KIND,
+      content: "join",
+      tags: [["ms", "200"]],
+      created_at: 1_700_000_013,
+    });
+    await guestbookSub.handler(lateJoin);
+
+    expect(onMemberJoin).toHaveBeenCalledTimes(2);
+    const lateCtx = onMemberJoin.mock.calls[1][0];
+    expect(lateCtx.defaultChannelId).toBe(PUBLIC_CHANNEL);
+    expect(lateCtx.defaultChannelName).toBe("general");
+    await lateCtx.replyChannel(`Welcome nostr:${ nip19.npubEncode(secondMember) }!`);
+    expect(currentHarness.published).toHaveLength(1);
+
+    const publicGroup = deriveConcordGroupKey(
+      "concord/channel",
+      Buffer.from(ROOT, "hex"),
+      Buffer.from(PUBLIC_CHANNEL, "hex"),
+      2,
+    );
+    const decoded = decodeConcordStreamEvent(currentHarness.published[0], publicGroup, {
+      channelId: PUBLIC_CHANNEL,
+      epoch: 2,
+      allowedKinds: [9],
+    });
+    expect(decoded?.rumor.content).toContain(nip19.npubEncode(secondMember));
+  });
+
+  it("isolates private channels in publishChannelMessage and waits for #general when folded asynchronously", async () => {
+    const notificationsChannelId =
+      "0daff3a90287ce6bef9a4f372aaa7b5689178ad5ec47c1647df22169b42cb314";
+    await currentHarness.manager.acceptDirectInvite(
+      directInviteRumor({
+        ...bundle(),
+        channels: [
+          {
+            id: notificationsChannelId,
+            key: PRIVATE_KEY,
+            epoch: 1,
+            name: "Notifications",
+          },
+        ],
+      }),
+    );
+    currentHarness.published.length = 0;
+
+    // 1. Publishing to "general" when only private "Notifications" is active must NOT fall back to "Notifications"
+    await expect(
+      currentHarness.manager.publishChannelMessage(
+        COMMUNITY_ID,
+        "general",
+        "Hello public",
+        [],
+        { waitTimeoutMs: 60 },
+      ),
+    ).rejects.toThrow("Concord channel is not active");
+    expect(currentHarness.published).toHaveLength(0);
+
+    // 2. Direct publish to private "Notifications" by channel ID or name succeeds
+    await currentHarness.manager.publishChannelMessage(
+      COMMUNITY_ID,
+      notificationsChannelId,
+      "🟢 New Subscription...",
+    );
+    await currentHarness.manager.publishChannelMessage(
+      COMMUNITY_ID,
+      "Notifications",
+      "🟢 Renewal...",
+    );
+    expect(currentHarness.published).toHaveLength(2);
+    const notificationsGroup = deriveConcordGroupKey(
+      "concord/channel",
+      Buffer.from(PRIVATE_KEY, "hex"),
+      Buffer.from(notificationsChannelId, "hex"),
+      1,
+    );
+    expect(
+      decodeConcordStreamEvent(currentHarness.published[0], notificationsGroup, {
+        channelId: notificationsChannelId,
+        epoch: 1,
+        allowedKinds: [9],
+      })?.rumor.content,
+    ).toBe("🟢 New Subscription...");
+    expect(
+      decodeConcordStreamEvent(currentHarness.published[1], notificationsGroup, {
+        channelId: notificationsChannelId,
+        epoch: 1,
+        allowedKinds: [9],
+      })?.rumor.content,
+    ).toBe("🟢 Renewal...");
+
+    currentHarness.published.length = 0;
+
+    // 3. When "general" is folded asynchronously within the readiness window, publishChannelMessage waits and publishes to "general"
+    const controlRead = deriveConcordGroupKey(
+      "concord/control",
+      Buffer.from(ROOT, "hex"),
+      Buffer.from(COMMUNITY_ID, "hex"),
+      2,
+    );
+    const controlGroup = {
+      ...controlRead,
+      secretKey: CONTROL_SIGNER_SECRET,
+      publicKey: CONTROL_PK,
+    };
+    const controlSub = findSubscription(CONTROL_PK);
+    setTimeout(() => {
+      void controlSub.handler(
+        createConcordStreamEvent(
+          OWNER_SECRET,
+          controlGroup,
+          {
+            kind: CONCORD_CONTROL_KIND,
+            content: JSON.stringify({ name: "general", private: false }),
+            tags: [["vsk", "2"], ["eid", PUBLIC_CHANNEL], ["ev", "1"]],
+            created_at: 1_700_000_020,
+          },
+          { sealKind: 20014 },
+        ),
+      );
+    }, 50);
+
+    await currentHarness.manager.publishChannelMessage(
+      COMMUNITY_ID,
+      "general",
+      "Hello public after fold",
+      [],
+      { waitTimeoutMs: 500 },
+    );
+
+    expect(currentHarness.published).toHaveLength(1);
+    const publicGroup = deriveConcordGroupKey(
+      "concord/channel",
+      Buffer.from(ROOT, "hex"),
+      Buffer.from(PUBLIC_CHANNEL, "hex"),
+      2,
+    );
+    expect(
+      decodeConcordStreamEvent(currentHarness.published[0], publicGroup, {
+        channelId: PUBLIC_CHANNEL,
+        epoch: 2,
+        allowedKinds: [9],
+      })?.rumor.content,
+    ).toBe("Hello public after fold");
+  });
+
+  it("merges new private channels, rotates channel/root epochs on direct re-invite, and ignores stale root_epoch invites", async () => {
+    const notificationsChannelId =
+      "0daff3a90287ce6bef9a4f372aaa7b5689178ad5ec47c1647df22169b42cb314";
+    const initialBundle: ConcordInviteBundle = {
+      ...bundle(),
+      root_epoch: 1,
+      channels: [],
+    };
+    await currentHarness.manager.acceptDirectInvite({
+      ...directInviteRumor(initialBundle),
+      id: "10".repeat(32),
+    });
+    expect(currentHarness.persistedCommunities[0]?.bundle.channels).toEqual([]);
+
+    // Re-invite adding private "Notifications" channel
+    const inviteWithNotifications: ConcordInviteBundle = {
+      ...initialBundle,
+      channels: [
+        {
+          id: notificationsChannelId,
+          key: PRIVATE_KEY,
+          epoch: 1,
+          name: "Notifications",
+        },
+      ],
+    };
+    await currentHarness.manager.acceptDirectInvite({
+      ...directInviteRumor(inviteWithNotifications),
+      id: "11".repeat(32),
+    });
+
+    const epoch1Group = deriveConcordGroupKey(
+      "concord/channel",
+      Buffer.from(PRIVATE_KEY, "hex"),
+      Buffer.from(notificationsChannelId, "hex"),
+      1,
+    );
+    const epoch1Sub = findSubscription(epoch1Group.publicKey);
+    expect(epoch1Sub).toBeDefined();
+    expect(currentHarness.persistedCommunities[0]?.bundle.channels).toEqual([
+      {
+        id: notificationsChannelId,
+        key: PRIVATE_KEY,
+        epoch: 1,
+        name: "Notifications",
+      },
+    ]);
+
+    // Subsequent re-invite rotating channel epoch (1 -> 2), key, and root_epoch (1 -> 2)
+    const rotatedKey = "66".repeat(32);
+    const rotatedRoot = "88".repeat(32);
+    const rotatedInvite: ConcordInviteBundle = {
+      ...inviteWithNotifications,
+      community_root: rotatedRoot,
+      root_epoch: 2,
+      relays: [...RELAYS, "wss://relay2.community.example"],
+      channels: [
+        {
+          id: notificationsChannelId,
+          key: rotatedKey,
+          epoch: 2,
+          name: "Notifications",
+        },
+      ],
+    };
+    await currentHarness.manager.acceptDirectInvite({
+      ...directInviteRumor(rotatedInvite),
+      id: "12".repeat(32),
+    });
+
+    expect(epoch1Sub.disposed).toBe(true);
+    const epoch2Group = deriveConcordGroupKey(
+      "concord/channel",
+      Buffer.from(rotatedKey, "hex"),
+      Buffer.from(notificationsChannelId, "hex"),
+      2,
+    );
+    expect(findSubscription(epoch2Group.publicKey)).toBeDefined();
+    expect(currentHarness.persistedCommunities[0]?.bundle).toEqual(
+      expect.objectContaining({
+        community_root: rotatedRoot,
+        root_epoch: 2,
+        relays: ["wss://community.example", "wss://relay2.community.example"],
+        channels: [
+          {
+            id: notificationsChannelId,
+            key: rotatedKey,
+            epoch: 2,
+            name: "Notifications",
+          },
+        ],
+      }),
+    );
+
+    currentHarness.published.length = 0;
+    await currentHarness.manager.publishChannelMessage(
+      COMMUNITY_ID,
+      notificationsChannelId,
+      "Rotated key notification",
+    );
+    expect(currentHarness.published).toHaveLength(1);
+    expect(
+      decodeConcordStreamEvent(currentHarness.published[0], epoch2Group, {
+        channelId: notificationsChannelId,
+        epoch: 2,
+        allowedKinds: [9],
+      })?.rumor.content,
+    ).toBe("Rotated key notification");
+
+    // Stale invite with root_epoch < existing.bundle.root_epoch is ignored
+    const staleInvite: ConcordInviteBundle = {
+      ...initialBundle,
+      root_epoch: 1,
+      channels: [
+        {
+          id: notificationsChannelId,
+          key: PRIVATE_KEY,
+          epoch: 1,
+          name: "Notifications",
+        },
+      ],
+    };
+    await currentHarness.manager.acceptDirectInvite({
+      ...directInviteRumor(staleInvite),
+      id: "13".repeat(32),
+    });
+    expect(currentHarness.persistedCommunities[0]?.bundle.root_epoch).toBe(2);
+    expect(currentHarness.persistedCommunities[0]?.bundle.channels[0]?.epoch).toBe(2);
+    expect(currentHarness.persistedCommunities[0]?.bundle.channels[0]?.key).toBe(
+      rotatedKey,
+    );
+  });
+
+  it("rejects Kind 3313 direct invites and private channel key rotations from unauthorized senders while allowing owner, folded admins, and allowedInviterPubkeys", async () => {
+    const notificationsChannelId =
+      "0daff3a90287ce6bef9a4f372aaa7b5689178ad5ec47c1647df22169b42cb314";
+    const attackerSecret = generateSecretKey();
+    const attackerPubkey = getPublicKey(attackerSecret);
+    const adminSecret = generateSecretKey();
+    const adminPubkey = getPublicKey(adminSecret);
+    const externalAdminSecret = generateSecretKey();
+    const externalAdminPubkey = getPublicKey(externalAdminSecret);
+
+    const manager = new ConcordCommunityManager({
+      secretKey: BOT_SECRET,
+      pubkey: BOT,
+      relayTransport: currentHarness.transport,
+      processMessage: currentHarness.processMessage,
+      isFreshEvent: currentHarness.isFreshEvent,
+      sendDirectMessage: currentHarness.sendDirectMessage,
+      allowedInviterPubkeys: [nip19.npubEncode(externalAdminPubkey)],
+      allowedCommunityIds: [COMMUNITY_ID],
+      store: {
+        loadCommunities: () => [...currentHarness.persistedCommunities],
+        saveCommunity: (community) => {
+          const idx = currentHarness.persistedCommunities.findIndex(
+            (item) => item.bundle.community_id === community.bundle.community_id,
+          );
+          if (idx >= 0) {
+            currentHarness.persistedCommunities[idx] = community;
+          } else {
+            currentHarness.persistedCommunities.push(community);
+          }
+        },
+      },
+      now: () => 1_700_000_000_123,
+    });
+
+    // 1. Initial invite forged by an unprivileged member/attacker (using real owner + owner_salt in payload) is rejected
+    await manager.acceptDirectInvite({
+      ...directInviteRumor(),
+      id: "20".repeat(32),
+      pubkey: attackerPubkey,
+    });
+    expect(currentHarness.persistedCommunities).toHaveLength(0);
+
+    // 2. Initial invite signed by community owner succeeds
+    await manager.acceptDirectInvite({
+      ...directInviteRumor(),
+      id: "21".repeat(32),
+      pubkey: OWNER,
+    });
+    expect(currentHarness.persistedCommunities).toHaveLength(1);
+
+    // 3. Attacker (regular community member) attempts to inject/hijack private Notifications channel key (epoch 99) -> rejected
+    const hijackedKey = "99".repeat(32);
+    const hijackAttempt: ConcordInviteBundle = {
+      ...bundle(),
+      channels: [
+        {
+          id: notificationsChannelId,
+          key: hijackedKey,
+          epoch: 99,
+          name: "Notifications",
+        },
+      ],
+    };
+    await manager.acceptDirectInvite({
+      ...directInviteRumor(hijackAttempt),
+      id: "22".repeat(32),
+      pubkey: attackerPubkey,
+    });
+    expect(
+      currentHarness.persistedCommunities[0]?.bundle.channels.find(
+        (c) => c.id === notificationsChannelId,
+      ),
+    ).toBeUndefined();
+
+    // 4. Invite signed by allow-listed npub in allowedInviterPubkeys succeeds
+    const validNotificationsInvite: ConcordInviteBundle = {
+      ...bundle(),
+      channels: [
+        {
+          id: notificationsChannelId,
+          key: PRIVATE_KEY,
+          epoch: 1,
+          name: "Notifications",
+        },
+      ],
+    };
+    await manager.acceptDirectInvite({
+      ...directInviteRumor(validNotificationsInvite),
+      id: "23".repeat(32),
+      pubkey: externalAdminPubkey,
+    });
+    expect(
+      currentHarness.persistedCommunities[0]?.bundle.channels.find(
+        (c) => c.id === notificationsChannelId,
+      ),
+    ).toEqual({
+      id: notificationsChannelId,
+      key: PRIVATE_KEY,
+      epoch: 1,
+      name: "Notifications",
+    });
+
+    // 5. Grant server-level Admin role to adminPubkey via Control stream, then rotate channel key via adminPubkey -> succeeds
+    const controlRead = deriveConcordGroupKey(
+      "concord/control",
+      Buffer.from(ROOT, "hex"),
+      Buffer.from(COMMUNITY_ID, "hex"),
+      2,
+    );
+    const controlGroup = {
+      ...controlRead,
+      secretKey: CONTROL_SIGNER_SECRET,
+      publicKey: CONTROL_PK,
+    };
+    const adminRoleId = "85".repeat(32);
+    const controlSub = findSubscription(CONTROL_PK);
+    await controlSub.handler(
+      createConcordStreamEvent(
+        OWNER_SECRET,
+        controlGroup,
+        {
+          kind: CONCORD_CONTROL_KIND,
+          content: JSON.stringify({
+            role_id: adminRoleId,
+            name: "Admin",
+            position: 1,
+            permissions: "0",
+            scope: { kind: "server" },
+          }),
+          tags: [["vsk", "1"], ["eid", adminRoleId], ["ev", "1"]],
+          created_at: 1_700_000_000,
+        },
+        { sealKind: 20014 },
+      ),
+    );
+    await controlSub.handler(
+      createConcordStreamEvent(
+        OWNER_SECRET,
+        controlGroup,
+        {
+          kind: CONCORD_CONTROL_KIND,
+          content: JSON.stringify({ member: adminPubkey, role_ids: [adminRoleId] }),
+          tags: [
+            ["vsk", "3"],
+            ["eid", computeConcordGrantLocator(COMMUNITY_ID, adminPubkey)],
+            ["ev", "1"],
+          ],
+          created_at: 1_700_000_001,
+        },
+        { sealKind: 20014 },
+      ),
+    );
+
+    const rotatedByFoldedAdminKey = "77".repeat(32);
+    await manager.acceptDirectInvite({
+      ...directInviteRumor({
+        ...bundle(),
+        channels: [
+          {
+            id: notificationsChannelId,
+            key: rotatedByFoldedAdminKey,
+            epoch: 2,
+            name: "Notifications",
+          },
+        ],
+      }),
+      id: "24".repeat(32),
+      pubkey: adminPubkey,
+    });
+    expect(
+      currentHarness.persistedCommunities[0]?.bundle.channels.find(
+        (c) => c.id === notificationsChannelId,
+      ),
+    ).toEqual({
+      id: notificationsChannelId,
+      key: rotatedByFoldedAdminKey,
+      epoch: 2,
+      name: "Notifications",
+    });
+  });
+
+  it("enforces allowedCommunityIds on both acceptDirectInvite and restoreCommunities", async () => {
+    const foreignOwnerSecret = generateSecretKey();
+    const foreignOwner = getPublicKey(foreignOwnerSecret);
+    const foreignSalt = "ab".repeat(32);
+    const foreignCommunityId = computeConcordCommunityId(foreignOwner, foreignSalt);
+    const foreignBundle: ConcordInviteBundle = {
+      ...bundle(),
+      community_id: foreignCommunityId,
+      owner: foreignOwner,
+      owner_salt: foreignSalt,
+    };
+
+    currentHarness.persistedCommunities.push({
+      bundle: foreignBundle,
+      joinPublished: true,
+    });
+
+    const restrictedManager = new ConcordCommunityManager({
+      secretKey: BOT_SECRET,
+      pubkey: BOT,
+      relayTransport: currentHarness.transport,
+      processMessage: currentHarness.processMessage,
+      isFreshEvent: currentHarness.isFreshEvent,
+      sendDirectMessage: currentHarness.sendDirectMessage,
+      allowedCommunityIds: [COMMUNITY_ID],
+      store: {
+        loadCommunities: () => [...currentHarness.persistedCommunities],
+        saveCommunity: (community) => {
+          currentHarness.persistedCommunities.push(community);
+        },
+      },
+      now: () => 1_700_000_000_123,
+    });
+
+    // Foreign persisted community is skipped on restoreCommunities
+    await restrictedManager.restoreCommunities();
+    expect(currentHarness.addRelays).not.toHaveBeenCalled();
+
+    // Direct invite for foreign community (even signed by foreignOwner) is rejected
+    await restrictedManager.acceptDirectInvite({
+      ...directInviteRumor(foreignBundle),
+      id: "30".repeat(32),
+      pubkey: foreignOwner,
+    });
+    expect(currentHarness.addRelays).not.toHaveBeenCalled();
+
+    // Direct invite for allow-listed COMMUNITY_ID signed by OWNER is accepted
+    await restrictedManager.acceptDirectInvite({
+      ...directInviteRumor(bundle()),
+      id: "31".repeat(32),
+      pubkey: OWNER,
+    });
+    expect(currentHarness.addRelays).toHaveBeenCalledWith(RELAYS);
+  });
 });
+
+
 
