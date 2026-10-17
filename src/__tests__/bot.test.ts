@@ -6,7 +6,7 @@ import {
   getPublicKey,
   type NostrEvent,
 } from "nostr-tools/pure";
-import { NostrCommunityBot } from "../bot.js";
+import { DEFAULT_BOT_DISCOVERY_RELAYS, NostrCommunityBot } from "../bot.js";
 import { unwrapDirectMessage } from "../nip17-dm.js";
 import {
   CONCORD_CONTROL_KIND,
@@ -1402,6 +1402,113 @@ describe("NostrCommunityBot", () => {
       bot: true,
     });
     expect(kind10304Event).toBeDefined();
+    const ensuredUrls = relayPoolMocks.ensureRelay.mock.calls.map(([url]) => url);
+    for (const discoveryRelay of DEFAULT_BOT_DISCOVERY_RELAYS) {
+      expect(ensuredUrls).toContain(discoveryRelay);
+    }
+  });
+
+  it("publishes Kind 10304 to external discovery relays without duplicating active relays and tolerates discovery relay failures", async () => {
+    const publishedByRelay = new Map<string, NostrEvent[]>();
+    relayPoolMocks.ensureRelay.mockImplementation(async (url: string) => {
+      if (url === "wss://purplepag.es" || url === "wss://relay.nostr.band") {
+        return {
+          onclose: null,
+          subscribe: relayPoolMocks.subscribe,
+          publish: vi.fn(async (event: NostrEvent) => {
+            if (url === "wss://purplepag.es") {
+              throw new Error("indexer rejected kind 10304");
+            }
+            const list = publishedByRelay.get(url) ?? [];
+            list.push(event);
+            publishedByRelay.set(url, list);
+            return "saved";
+          }),
+        };
+      }
+      return {
+        onclose: null,
+        subscribe: relayPoolMocks.subscribe,
+        publish: vi.fn(async (event: NostrEvent) => {
+          const list = publishedByRelay.get(url) ?? [];
+          list.push(event);
+          publishedByRelay.set(url, list);
+          return "saved";
+        }),
+      };
+    });
+
+    const bot = new NostrCommunityBot({
+      nsec: TEST_SECRET_HEX,
+      relays: ["wss://relay.damus.io", "wss://nos.lol"],
+      botManifest: { enabled: true, publishBotProfileFlag: false },
+    });
+    bot.registerCommand("ping", () => undefined, {
+      description: "Ping a Lightning node",
+    });
+
+    expect(bot.getDiscoveryRelays()).toEqual([...DEFAULT_BOT_DISCOVERY_RELAYS]);
+    await bot.start();
+
+    expect(publishedByRelay.get("wss://relay.damus.io")).toHaveLength(1);
+    expect(publishedByRelay.get("wss://nos.lol")).toHaveLength(1);
+    expect(publishedByRelay.get("wss://relay.nostr.band")).toHaveLength(1);
+    expect(publishedByRelay.get("wss://relay.nostr.band")?.[0]?.kind).toBe(10304);
+
+    // Even if all external discovery relays fail, primary relay publication succeeds.
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      relayPoolMocks.ensureRelay.mockImplementation(async (url: string) => {
+        if (!url.includes("damus") && !url.includes("nos.lol")) {
+          throw new Error("discovery relay offline");
+        }
+        return createMockRelay();
+      });
+      await expect(bot.publishBotManifest()).resolves.toBe(true);
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining(
+          "[Nostr] Best-effort Kind 10304 publication to discovery relays did not succeed",
+        ),
+      );
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("validates custom discoveryRelays and supports empty array opt-out", () => {
+    const optOutBot = new NostrCommunityBot({
+      nsec: TEST_SECRET_HEX,
+      relays: TEST_RELAYS,
+      botManifest: { enabled: true, discoveryRelays: [] },
+    });
+    expect(optOutBot.getDiscoveryRelays()).toEqual([]);
+
+    expect(
+      () =>
+        new NostrCommunityBot({
+          nsec: TEST_SECRET_HEX,
+          relays: TEST_RELAYS,
+          botManifest: { enabled: true, discoveryRelays: ["ws://purplepag.es"] },
+        }),
+    ).toThrow(/invalid discovery relay URL/);
+
+    expect(
+      () =>
+        new NostrCommunityBot({
+          nsec: TEST_SECRET_HEX,
+          relays: TEST_RELAYS,
+          botManifest: { enabled: true, discoveryRelays: ["wss://127.0.0.1"] },
+        }),
+    ).toThrow(/invalid discovery relay URL/);
+
+    expect(
+      () =>
+        new NostrCommunityBot({
+          nsec: TEST_SECRET_HEX,
+          relays: TEST_RELAYS,
+          botManifest: { enabled: true, discoveryRelays: ["wss://localhost"] },
+        }),
+    ).toThrow(/invalid discovery relay URL/);
   });
 
   it("refuses to publish a blank Kind 0 profile when no existing Kind 0 is found on relays", async () => {

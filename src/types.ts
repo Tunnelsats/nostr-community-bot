@@ -124,6 +124,14 @@ export interface BotManifestConfig {
   enabled: boolean;
   /** When true (default when enabled), non-destructively ensures `"bot": true` (NIP-24) on existing Kind 0 profile metadata. */
   publishBotProfileFlag?: boolean;
+  /**
+   * Additional discovery relays (such as Armada's DISCOVERY_RELAYS:
+   * wss://purplepag.es, wss://relay.nostr.band, wss://nos.lol) to publish
+   * replaceable Kind 10304 command manifests and Kind 0 bot profile updates to,
+   * alongside connected bot relays. Defaults to DEFAULT_BOT_DISCOVERY_RELAYS
+   * when botManifest is enabled. Pass `[]` to disable external discovery relay publication.
+   */
+  discoveryRelays?: string[];
 }
 
 export interface CommandRegistrationOptions {

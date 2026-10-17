@@ -18,7 +18,10 @@ import {
   type RelayConnectionStatus,
 } from "./types.js";
 import { parseSecretKey, parseCommand } from "./event-utils.js";
-import { RelayConnectionManager } from "./relay-connection-manager.js";
+import {
+  RelayConnectionManager,
+  validatePublicRelayAddress,
+} from "./relay-connection-manager.js";
 import type { NostrEvent } from "nostr-tools/pure";
 import {
   createDirectMessage,
@@ -40,6 +43,11 @@ import {
 export { DEFAULT_CHANNEL_ALLOWED_COMMANDS };
 
 export const BOT_MANIFEST_KIND = 10304;
+export const DEFAULT_BOT_DISCOVERY_RELAYS = [
+  "wss://purplepag.es",
+  "wss://relay.nostr.band",
+  "wss://nos.lol",
+] as const;
 
 const MANIFEST_NAME_RE = /^[a-z0-9_-]{1,32}$/;
 const MAX_MANIFEST_COMMANDS = 64;
@@ -49,6 +57,7 @@ const MAX_MANIFEST_CHOICE_BYTES = 32;
 const MAX_MANIFEST_DESCRIPTION_BYTES = 200;
 const MAX_MANIFEST_BYTES = 32_768;
 const MAX_PROFILE_CONTENT_BYTES = 65_536;
+const MAX_DISCOVERY_RELAYS = 16;
 const VALID_MANIFEST_ARG_TYPES = new Set<BotCommandArgType>([
   "string",
   "int",
@@ -195,6 +204,7 @@ export class NostrCommunityBot {
   private secretKey: Uint8Array;
   private pubkeyHex: string;
   private relays: string[];
+  private discoveryRelays: string[];
   private commands: Map<string, CommandHandler> = new Map();
   private channelCommandPermissions: Map<string, boolean> = new Map();
   private commandManifestEntries: Map<string, BotCommandManifestEntry> = new Map();
@@ -220,6 +230,29 @@ export class NostrCommunityBot {
     this.secretKey = parseSecretKey(config.nsec);
     this.pubkeyHex = getPublicKey(this.secretKey);
     this.relays = [...new Set(config.relays)];
+    const rawDiscoveryRelays =
+      config.botManifest?.discoveryRelays !== undefined
+        ? config.botManifest.discoveryRelays
+        : config.botManifest?.enabled
+          ? [...DEFAULT_BOT_DISCOVERY_RELAYS]
+          : [];
+    const normalizedDiscoveryRelays = rawDiscoveryRelays.map((entry) => {
+      const trimmed = typeof entry === "string" ? entry.trim() : "";
+      try {
+        validatePublicRelayAddress(trimmed);
+      } catch {
+        throw new Error("NostrBotConfig error: invalid discovery relay URL.");
+      }
+      return trimmed;
+    });
+    const deduplicatedDiscoveryRelays = [...new Set(normalizedDiscoveryRelays)];
+    if (deduplicatedDiscoveryRelays.length > MAX_DISCOVERY_RELAYS) {
+      throw new Error(
+        `NostrBotConfig error: at most ${MAX_DISCOVERY_RELAYS} discovery relays are allowed.`,
+      );
+    }
+    this.discoveryRelays = deduplicatedDiscoveryRelays;
+
     const offlineGraceSeconds =
       config.directMessageReplay?.offlineGraceSeconds ?? DEFAULT_DM_OFFLINE_GRACE_SECONDS;
     if (
@@ -282,6 +315,10 @@ export class NostrCommunityBot {
     return [...this.relays];
   }
 
+  public getDiscoveryRelays(): string[] {
+    return [...this.discoveryRelays];
+  }
+
   public getRelayStatuses(): RelayConnectionStatus[] {
     return this.relayConnections.getRelayStatuses();
   }
@@ -338,6 +375,41 @@ export class NostrCommunityBot {
     };
   }
 
+  private getExternalDiscoveryRelays(): string[] {
+    if (this.discoveryRelays.length === 0) {
+      return [];
+    }
+    const managedCanonicalUrls = new Set<string>();
+    for (const status of this.relayConnections.getRelayStatuses()) {
+      try {
+        managedCanonicalUrls.add(new URL(status.url).toString());
+      } catch {
+        managedCanonicalUrls.add(status.url);
+      }
+    }
+    return this.discoveryRelays.filter((url) => {
+      try {
+        return !managedCanonicalUrls.has(new URL(url).toString());
+      } catch {
+        return !managedCanonicalUrls.has(url);
+      }
+    });
+  }
+
+  private async publishToDiscoveryRelays(event: NostrEvent): Promise<void> {
+    const targets = this.getExternalDiscoveryRelays();
+    if (targets.length === 0 || !this.acceptingRelayEvents) {
+      return;
+    }
+    try {
+      await this.relayConnections.publishToRelays(event, targets);
+    } catch {
+      console.warn(
+        `[Nostr] Best-effort Kind ${event.kind} publication to discovery relays did not succeed`,
+      );
+    }
+  }
+
   public async publishBotManifest(): Promise<boolean> {
     if (!this.acceptingRelayEvents) {
       throw new Error("Nostr bot is not running");
@@ -362,6 +434,7 @@ export class NostrCommunityBot {
       this.secretKey,
     );
     await this.relayConnections.publish(event);
+    await this.publishToDiscoveryRelays(event);
     return true;
   }
 
@@ -419,6 +492,7 @@ export class NostrCommunityBot {
 
     if (parsedMetadata.bot === true) {
       await this.relayConnections.publish(latestEvent);
+      await this.publishToDiscoveryRelays(latestEvent);
       return true;
     }
 
@@ -436,6 +510,7 @@ export class NostrCommunityBot {
       this.secretKey,
     );
     await this.relayConnections.publish(updatedEvent);
+    await this.publishToDiscoveryRelays(updatedEvent);
     return true;
   }
 

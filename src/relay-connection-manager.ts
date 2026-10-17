@@ -20,7 +20,13 @@ const RELAY_QUERY_FAILED = "Relay query failed";
 const MAX_WEBSOCKET_PAYLOAD_BYTES = 1024 * 1024;
 export const MAX_PERSISTENT_RELAY_COUNT = 32;
 
-function validatePublicRelayAddress(address: string | URL): string | URL {
+export function validatePublicRelayAddress(address: string | URL): string | URL {
+  if (
+    typeof address === "string" &&
+    (address.length === 0 || address.length > 2_048)
+  ) {
+    throw new Error("Relay URL must target a public IP address over wss");
+  }
   const url = address instanceof URL ? address : new URL(address);
   const hostname = url.hostname.replace(/^\[|\]$/g, "");
   if (
@@ -28,6 +34,8 @@ function validatePublicRelayAddress(address: string | URL): string | URL {
     url.username.length > 0 ||
     url.password.length > 0 ||
     url.hash.length > 0 ||
+    hostname.length === 0 ||
+    hostname.toLowerCase() === "localhost" ||
     (isIP(hostname) !== 0 && !isPublicIpAddress(hostname))
   ) {
     throw new Error("Relay URL must target a public IP address over wss");
