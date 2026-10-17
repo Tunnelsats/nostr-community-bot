@@ -1675,7 +1675,84 @@ describe("ConcordCommunityManager", () => {
     });
     expect(currentHarness.addRelays).toHaveBeenCalledWith(RELAYS);
   });
+
+  it("restores persisted communities before processing early relay-replayed invites on startup", async () => {
+    const notificationsChannelId = "0daff3a90287ce6bef9a4f372aaa7b5689178ad5ec47c1647df22169b42cb314";
+    const notificationsChannelKey = "99".repeat(32);
+    const persistedBundle: ConcordInviteBundle = {
+      ...bundle(),
+      channels: [
+        {
+          id: notificationsChannelId,
+          key: notificationsChannelKey,
+          epoch: 1,
+          name: "Notifications",
+        },
+      ],
+    };
+
+    const stored: PersistedConcordCommunity[] = [
+      {
+        bundle: persistedBundle,
+        joinPublished: true,
+      },
+    ];
+    const saveCommunitySpy = vi.fn((updated: PersistedConcordCommunity) => {
+      const idx = stored.findIndex(
+        (entry) => entry.bundle.community_id === updated.bundle.community_id,
+      );
+      if (idx >= 0) {
+        stored[idx] = updated;
+      } else {
+        stored.push(updated);
+      }
+    });
+
+    const startupManager = new ConcordCommunityManager({
+      secretKey: BOT_SECRET,
+      pubkey: BOT,
+      relayTransport: currentHarness.transport,
+      processMessage: currentHarness.processMessage,
+      isFreshEvent: currentHarness.isFreshEvent,
+      sendDirectMessage: currentHarness.sendDirectMessage,
+      store: {
+        loadCommunities: () => stored.map((entry) => structuredClone(entry)),
+        saveCommunity: saveCommunitySpy,
+      },
+      now: () => 1_700_000_000_123,
+    });
+
+    // Simulate a fast relay replaying an older 0-channel community invite
+    // during relayConnections.start() before restoreCommunities() is called.
+    const emptyInviteBundle: ConcordInviteBundle = {
+      ...bundle(),
+      channels: [],
+    };
+    await startupManager.acceptDirectInvite({
+      ...directInviteRumor(emptyInviteBundle),
+      id: "08".repeat(32),
+      pubkey: OWNER,
+    });
+
+    await startupManager.restoreCommunities();
+
+    // Must not re-publish Kind 3306 Join or overwrite stored private channels with []
+    expect(currentHarness.publishToRelays).not.toHaveBeenCalled();
+    expect(saveCommunitySpy).not.toHaveBeenCalled();
+    expect(stored[0]?.bundle.channels).toEqual([
+      {
+        id: notificationsChannelId,
+        key: notificationsChannelKey,
+        epoch: 1,
+        name: "Notifications",
+      },
+    ]);
+
+    await startupManager.publishChannelMessage(
+      COMMUNITY_ID,
+      notificationsChannelId,
+      "Private notification after restart",
+    );
+    expect(currentHarness.publishToRelays).toHaveBeenCalledTimes(1);
+  });
 });
-
-
-
