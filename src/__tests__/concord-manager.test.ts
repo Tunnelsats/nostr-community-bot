@@ -59,6 +59,7 @@ interface Harness {
   sendDirectMessage: ReturnType<
     typeof vi.fn<(recipientPubkey: string, message: string) => Promise<void>>
   >;
+  isFreshEvent: ReturnType<typeof vi.fn<(createdAt: number) => boolean>>;
   processMessage: ReturnType<
     typeof vi.fn<
       (
@@ -110,6 +111,7 @@ function createHarness(): Harness {
   const sendDirectMessage = vi
     .fn<(recipientPubkey: string, message: string) => Promise<void>>()
     .mockResolvedValue();
+  const isFreshEvent = vi.fn<(createdAt: number) => boolean>(() => true);
   const transport: ConcordRelayTransport = {
     addRelays,
     registerSubscription: vi.fn((filter, handler) => {
@@ -139,6 +141,7 @@ function createHarness(): Harness {
       pubkey: BOT,
       relayTransport: transport,
       processMessage,
+      isFreshEvent,
       sendDirectMessage,
       store: {
         loadCommunities: () => [...persistedCommunities],
@@ -162,6 +165,7 @@ function createHarness(): Harness {
     addRelays,
     publishToRelays,
     sendDirectMessage,
+    isFreshEvent,
     processMessage,
   };
 }
@@ -968,4 +972,52 @@ describe("ConcordCommunityManager", () => {
       );
     }
   });
+
+  it("suppresses startup log spam for historical or duplicate stream wraps and logs fresh Kind 9 messages once", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      await currentHarness.manager.acceptDirectInvite(directInviteRumor());
+      logSpy.mockClear();
+
+      const group = deriveConcordGroupKey(
+        "concord/channel",
+        Buffer.from(PRIVATE_KEY, "hex"),
+        Buffer.from(PRIVATE_CHANNEL, "hex"),
+        4,
+      );
+      const channelSub = findSubscription(group.publicKey);
+
+      currentHarness.isFreshEvent.mockReturnValueOnce(false);
+      const staleWrap = createConcordStreamEvent(MEMBER_SECRET, group, {
+        kind: 9,
+        content: "/ping",
+        tags: [["channel", PRIVATE_CHANNEL], ["epoch", "4"]],
+        created_at: 1_699_999_000,
+      });
+      await channelSub.handler(staleWrap);
+      expect(logSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining("Received stream wrap"),
+      );
+      expect(logSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining("[Concord] Decrypted Kind 9 message"),
+      );
+
+      const freshWrap = createConcordStreamEvent(MEMBER_SECRET, group, {
+        kind: 9,
+        content: "/ping",
+        tags: [["channel", PRIVATE_CHANNEL], ["epoch", "4"]],
+        created_at: 1_700_000_020,
+      });
+      await channelSub.handler(freshWrap);
+      await channelSub.handler(freshWrap);
+
+      const decryptedLogs = logSpy.mock.calls.filter(([msg]) =>
+        typeof msg === "string" && msg.includes("[Concord] Decrypted Kind 9 message"),
+      );
+      expect(decryptedLogs).toHaveLength(1);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
 });
+
