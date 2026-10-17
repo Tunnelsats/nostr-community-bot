@@ -227,6 +227,7 @@ export class ConcordCommunityManager {
   private readonly acceptedInvites = new Set<string>();
   private readonly channelWaiters = new Set<() => void>();
   private inviteQueue: Promise<void> = Promise.resolve();
+  private restoredFromStore = false;
   private accepting = true;
 
   public constructor(options: ConcordCommunityManagerOptions) {
@@ -288,8 +289,15 @@ export class ConcordCommunityManager {
 
   public async restoreCommunities(): Promise<void> {
     this.accepting = true;
-    if (!this.store) return;
+    const task = this.inviteQueue.then(() => this.restoreCommunitiesSerial());
+    this.inviteQueue = task.catch(() => undefined);
+    return task;
+  }
+
+  private async restoreCommunitiesSerial(): Promise<void> {
+    if (this.restoredFromStore || !this.store) return;
     const persistedList = await this.store.loadCommunities();
+    this.restoredFromStore = true;
     for (const persisted of persistedList) {
       if (!this.accepting) return;
       const bundle = validateConcordInvite(persisted.bundle, 0);
@@ -335,6 +343,14 @@ export class ConcordCommunityManager {
     ) {
       return;
     }
+    if (!this.restoredFromStore && this.store) {
+      try {
+        await this.restoreCommunitiesSerial();
+      } catch (error) {
+        console.warn("[Concord] Deferred community store restore failed:", error);
+      }
+      if (!this.accepting) return;
+    }
     console.log(`[Concord] Processing direct invite rumor ${rumor.id.slice(0, 8)}... from ${rumor.pubkey.slice(0, 8)}...`);
     let payload: unknown;
     try {
@@ -361,7 +377,6 @@ export class ConcordCommunityManager {
       );
       return;
     }
-    console.log(`[Concord] Accepted direct invite for community ${bundle.community_id.slice(0, 8)}... with ${bundle.channels.length} channel(s) across ${bundle.relays.length} relay(s)`);
     if (existing) {
       if (
         existing.bundle.control_pk !== bundle.control_pk ||
@@ -370,6 +385,30 @@ export class ConcordCommunityManager {
         return;
       }
       if (bundle.root_epoch < existing.bundle.root_epoch) {
+        return;
+      }
+      const rootChanged =
+        bundle.root_epoch > existing.bundle.root_epoch ||
+        bundle.community_root !== existing.bundle.community_root;
+      const hasNewRelays = bundle.relays.some(
+        (relay) => !existing.bundle.relays.includes(relay),
+      );
+      const hasChannelUpdates = bundle.channels.some((channel) => {
+        const held = existing.bundle.channels.find((c) => c.id === channel.id);
+        if (!held) return true;
+        if (
+          channel.epoch > held.epoch ||
+          (channel.epoch === held.epoch && channel.key !== held.key) ||
+          (!held.name && channel.name)
+        ) {
+          return true;
+        }
+        return ![...existing.channels.values()].some(
+          (ch) => ch.active && ch.channelId === channel.id,
+        );
+      });
+      if (!rootChanged && !hasNewRelays && !hasChannelUpdates && existing.joinPublished) {
+        this.rememberInvite(rumor.id);
         return;
       }
       const newChannels = bundle.channels.filter(
@@ -381,14 +420,12 @@ export class ConcordCommunityManager {
       ) {
         return;
       }
+      console.log(`[Concord] Accepted direct invite for community ${bundle.community_id.slice(0, 8)}... with ${bundle.channels.length} channel(s) across ${bundle.relays.length} relay(s)`);
       await this.relayTransport.addRelays(bundle.relays);
       console.log(`[Concord] Community relay registration completed for ${bundle.relays.length} relay(s)`);
       if (!this.accepting) return;
 
-      if (
-        bundle.root_epoch > existing.bundle.root_epoch ||
-        bundle.community_root !== existing.bundle.community_root
-      ) {
+      if (rootChanged) {
         existing.bundle.root_epoch = bundle.root_epoch;
         existing.bundle.community_root = bundle.community_root;
         const controlRead = deriveConcordGroupKey(
@@ -492,6 +529,7 @@ export class ConcordCommunityManager {
       this.rememberInvite(rumor.id);
       return;
     }
+    console.log(`[Concord] Accepted direct invite for community ${bundle.community_id.slice(0, 8)}... with ${bundle.channels.length} channel(s) across ${bundle.relays.length} relay(s)`);
     if (this.communities.size >= MAX_COMMUNITIES) return;
     if (
       this.channelSubscriptionCount() + bundle.channels.length >
@@ -683,6 +721,7 @@ export class ConcordCommunityManager {
   public stop(): void {
     if (!this.accepting) return;
     this.accepting = false;
+    this.restoredFromStore = false;
     this.notifyChannelWaiters();
     for (const state of this.communities.values()) {
       state.controlDispose();
