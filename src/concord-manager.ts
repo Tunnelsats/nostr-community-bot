@@ -657,7 +657,7 @@ export class ConcordCommunityManager {
   }
 
   private async handleControlEvent(state: CommunityState, event: NostrEvent): Promise<void> {
-    if (!this.accepting) return;
+    if (!this.accepting || this.processedWraps.has(event.id)) return;
     const decoded = decodeConcordStreamEvent(event, state.controlReadGroup, {
       allowedKinds: [CONCORD_CONTROL_KIND],
       sealKind: 20014,
@@ -705,7 +705,7 @@ export class ConcordCommunityManager {
   }
 
   private async handleGuestbookEvent(state: CommunityState, event: NostrEvent): Promise<void> {
-    if (!this.accepting) return;
+    if (!this.accepting || this.processedWraps.has(event.id)) return;
     const decoded = decodeConcordStreamEvent(event, state.guestbookGroup, {
       allowedKinds: [CONCORD_JOIN_KIND],
     });
@@ -771,8 +771,7 @@ export class ConcordCommunityManager {
     channel: ChannelContext,
     event: NostrEvent,
   ): Promise<void> {
-    if (!this.accepting || !channel.active) return;
-    console.log(`[Concord] Received stream wrap ${event.id.slice(0, 8)}... in channel ${channel.channelId.slice(0, 8)}...`);
+    if (!this.accepting || !channel.active || this.processedWraps.has(event.id)) return;
     const decoded = decodeConcordStreamEvent(event, channel.group, {
       allowedKinds: [9],
       channelId: channel.channelId,
