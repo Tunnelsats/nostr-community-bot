@@ -145,7 +145,7 @@ afterEach(() => {
 });
 
 describe("secure relay WebSocket", () => {
-  it("installs checked DNS lookup, disables redirects, and bounds payloads", () => {
+  it("installs checked DNS lookup, disables redirects, sets handshakeTimeout, and bounds payloads", () => {
     let capturedOptions: Record<string, unknown> | undefined;
     class FakeWebSocket {
       public constructor(
@@ -166,6 +166,7 @@ describe("secure relay WebSocket", () => {
     expect(capturedOptions).toEqual(
       expect.objectContaining({
         followRedirects: false,
+        handshakeTimeout: 3_000,
         lookup: expect.any(Function),
         maxPayload: 1024 * 1024,
       }),
@@ -174,6 +175,53 @@ describe("secure relay WebSocket", () => {
     expect(() => new Implementation("wss://127.0.0.1")).toThrow(
       "public IP address",
     );
+  });
+
+  it("prevents unhandled EventEmitter error crashes when nostr-tools clears ws.onerror before late socket errors", async () => {
+    const { EventEmitter } = await import("node:events");
+    class FakeEmitterWebSocket extends EventEmitter {
+      private onerrorHandler: ((err: unknown) => void) | null = null;
+
+      public constructor(
+        _address: string | URL,
+        _protocols?: string | string[],
+        _options?: Record<string, unknown>,
+      ) {
+        super();
+      }
+
+      public get onerror(): ((err: unknown) => void) | null {
+        return this.onerrorHandler;
+      }
+
+      public set onerror(handler: ((err: unknown) => void) | null) {
+        if (this.onerrorHandler) {
+          this.removeListener("error", this.onerrorHandler);
+        }
+        this.onerrorHandler = handler;
+        if (handler) {
+          this.on("error", handler);
+        }
+      }
+    }
+
+    const Implementation = createPublicWebSocketImplementation(
+      async () => ["93.184.216.34"],
+      FakeEmitterWebSocket as unknown as typeof import("ws").default,
+    );
+
+    const ws = new Implementation("wss://relay.nostr.band") as unknown as FakeEmitterWebSocket;
+    const nostrToolsErrorSpy = vi.fn();
+    ws.onerror = nostrToolsErrorSpy;
+
+    // Simulate nostr-tools handleHardClose() on connection timeout clearing ws.onerror = null
+    ws.onerror = null;
+
+    // Simulate late TCP ETIMEDOUT / abortHandshake error emitted by ws after onerror was cleared
+    expect(() =>
+      ws.emit("error", Object.assign(new Error("connect ETIMEDOUT 95.216.33.150:443"), { code: "ETIMEDOUT" })),
+    ).not.toThrow();
+    expect(nostrToolsErrorSpy).not.toHaveBeenCalled();
   });
 });
 

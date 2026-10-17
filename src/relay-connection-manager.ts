@@ -82,9 +82,13 @@ export function createPublicWebSocketImplementation(
     public constructor(address: string | URL, protocols?: string | string[]) {
       super(validatePublicRelayAddress(address), protocols, {
         followRedirects: false,
+        handshakeTimeout: CONNECTION_TIMEOUT_MS,
         lookup: createPublicLookup(resolver),
         maxPayload: MAX_WEBSOCKET_PAYLOAD_BYTES,
       });
+      if (typeof this.on === "function") {
+        this.on("error", () => undefined);
+      }
     }
   }
   return PublicRelayWebSocket as typeof WebSocket;
