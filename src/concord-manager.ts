@@ -89,6 +89,8 @@ interface ConcordCommunityManagerOptions {
   store?: ConcordCommunityStore;
   defaultChannelId?: string;
   channelReadyTimeoutMs?: number;
+  allowedCommunityIds?: string[];
+  allowedInviterPubkeys?: string[];
   onMemberJoin?: ConcordMemberJoinHandler;
   onChannelMention?: ConcordChannelMentionHandler;
   now?: () => number;
@@ -121,6 +123,46 @@ function emptyControl(bundle: ConcordInviteBundle): FoldedConcordControl {
     communityId: bundle.community_id,
     owner: bundle.owner,
   });
+}
+
+function normalizeCommunityIdSet(entries?: string[]): Set<string> {
+  const result = new Set<string>();
+  if (!entries) return result;
+  for (const raw of entries) {
+    const trimmed = raw.trim().toLowerCase();
+    if (/^[0-9a-f]{64}$/.test(trimmed)) {
+      result.add(trimmed);
+    }
+  }
+  return result;
+}
+
+function normalizePubkeySet(entries?: string[]): Set<string> {
+  const result = new Set<string>();
+  if (!entries) return result;
+  for (const raw of entries) {
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+      result.add(trimmed.toLowerCase());
+      continue;
+    }
+    if (trimmed.toLowerCase().startsWith("npub1")) {
+      try {
+        const decoded = nip19.decode(trimmed);
+        if (
+          decoded.type === "npub" &&
+          typeof decoded.data === "string" &&
+          /^[0-9a-fA-F]{64}$/.test(decoded.data)
+        ) {
+          result.add(decoded.data.toLowerCase());
+        }
+      } catch {
+        // Ignore malformed npub entries
+      }
+    }
+  }
+  return result;
 }
 
 function tagValue(tags: string[][], name: string): string | undefined {
@@ -174,6 +216,8 @@ export class ConcordCommunityManager {
   private readonly store?: ConcordCommunityStore;
   private readonly defaultChannelId?: string;
   private readonly channelReadyTimeoutMs: number;
+  private readonly allowedCommunityIds: Set<string>;
+  private readonly allowedInviterPubkeys: Set<string>;
   private onMemberJoinHandler?: ConcordMemberJoinHandler;
   private onChannelMentionHandler?: ConcordChannelMentionHandler;
   private readonly now: () => number;
@@ -200,6 +244,8 @@ export class ConcordCommunityManager {
     this.store = options.store;
     this.defaultChannelId = options.defaultChannelId;
     this.channelReadyTimeoutMs = options.channelReadyTimeoutMs ?? 1_500;
+    this.allowedCommunityIds = normalizeCommunityIdSet(options.allowedCommunityIds);
+    this.allowedInviterPubkeys = normalizePubkeySet(options.allowedInviterPubkeys);
     this.onMemberJoinHandler = options.onMemberJoin;
     this.onChannelMentionHandler = options.onChannelMention;
     this.now = options.now ?? Date.now;
@@ -213,6 +259,33 @@ export class ConcordCommunityManager {
     this.onChannelMentionHandler = handler;
   }
 
+  private isCommunityAllowed(communityId: string): boolean {
+    if (this.allowedCommunityIds.size === 0) return true;
+    return this.allowedCommunityIds.has(communityId.toLowerCase());
+  }
+
+  private isInviteSenderAuthorized(
+    senderPubkey: string,
+    bundle: ConcordInviteBundle,
+    existing?: CommunityState,
+  ): boolean {
+    const sender = senderPubkey.trim().toLowerCase();
+    if (this.allowedInviterPubkeys.has(sender)) {
+      return true;
+    }
+    if (existing) {
+      if (sender === existing.bundle.owner.toLowerCase()) {
+        return true;
+      }
+      const role = existing.control.roleFor(sender);
+      return role === "owner" || role === "admin";
+    }
+    if (this.allowedInviterPubkeys.size > 0 && this.allowedCommunityIds.size === 0) {
+      return false;
+    }
+    return sender === bundle.owner.toLowerCase();
+  }
+
   public async restoreCommunities(): Promise<void> {
     this.accepting = true;
     if (!this.store) return;
@@ -221,6 +294,7 @@ export class ConcordCommunityManager {
       if (!this.accepting) return;
       const bundle = validateConcordInvite(persisted.bundle, 0);
       if (!bundle) continue;
+      if (!this.isCommunityAllowed(bundle.community_id)) continue;
       if (this.communities.has(bundle.community_id)) continue;
       if (this.communities.size >= MAX_COMMUNITIES) break;
       if (
@@ -274,8 +348,20 @@ export class ConcordCommunityManager {
       console.warn(`[Concord] Direct invite validation failed for rumor ${rumor.id.slice(0, 8)}...`);
       return;
     }
-    console.log(`[Concord] Accepted direct invite for community ${bundle.community_id.slice(0, 8)}... with ${bundle.channels.length} channel(s) across ${bundle.relays.length} relay(s)`);
+    if (!this.isCommunityAllowed(bundle.community_id)) {
+      console.warn(
+        `[Concord] Rejected direct invite for non-allowlisted community ${bundle.community_id.slice(0, 8)}... from ${rumor.pubkey.slice(0, 8)}...`,
+      );
+      return;
+    }
     const existing = this.communities.get(bundle.community_id);
+    if (!this.isInviteSenderAuthorized(rumor.pubkey, bundle, existing)) {
+      console.warn(
+        `[Concord] Rejected direct invite for community ${bundle.community_id.slice(0, 8)}... from unauthorized sender ${rumor.pubkey.slice(0, 8)}...`,
+      );
+      return;
+    }
+    console.log(`[Concord] Accepted direct invite for community ${bundle.community_id.slice(0, 8)}... with ${bundle.channels.length} channel(s) across ${bundle.relays.length} relay(s)`);
     if (existing) {
       if (
         existing.bundle.control_pk !== bundle.control_pk ||

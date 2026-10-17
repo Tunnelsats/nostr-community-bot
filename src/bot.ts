@@ -290,6 +290,8 @@ export class NostrCommunityBot {
           store: config.concord.store,
           defaultChannelId: config.concord.defaultChannelId,
           channelReadyTimeoutMs: config.concord.channelReadyTimeoutMs,
+          allowedCommunityIds: config.concord.allowedCommunityIds,
+          allowedInviterPubkeys: config.concord.allowedInviterPubkeys,
           onMemberJoin: config.concord.onMemberJoin,
           onChannelMention: config.concord.onChannelMention,
         })

@@ -1438,6 +1438,244 @@ describe("ConcordCommunityManager", () => {
       rotatedKey,
     );
   });
+
+  it("rejects Kind 3313 direct invites and private channel key rotations from unauthorized senders while allowing owner, folded admins, and allowedInviterPubkeys", async () => {
+    const notificationsChannelId =
+      "0daff3a90287ce6bef9a4f372aaa7b5689178ad5ec47c1647df22169b42cb314";
+    const attackerSecret = generateSecretKey();
+    const attackerPubkey = getPublicKey(attackerSecret);
+    const adminSecret = generateSecretKey();
+    const adminPubkey = getPublicKey(adminSecret);
+    const externalAdminSecret = generateSecretKey();
+    const externalAdminPubkey = getPublicKey(externalAdminSecret);
+
+    const manager = new ConcordCommunityManager({
+      secretKey: BOT_SECRET,
+      pubkey: BOT,
+      relayTransport: currentHarness.transport,
+      processMessage: currentHarness.processMessage,
+      isFreshEvent: currentHarness.isFreshEvent,
+      sendDirectMessage: currentHarness.sendDirectMessage,
+      allowedInviterPubkeys: [nip19.npubEncode(externalAdminPubkey)],
+      allowedCommunityIds: [COMMUNITY_ID],
+      store: {
+        loadCommunities: () => [...currentHarness.persistedCommunities],
+        saveCommunity: (community) => {
+          const idx = currentHarness.persistedCommunities.findIndex(
+            (item) => item.bundle.community_id === community.bundle.community_id,
+          );
+          if (idx >= 0) {
+            currentHarness.persistedCommunities[idx] = community;
+          } else {
+            currentHarness.persistedCommunities.push(community);
+          }
+        },
+      },
+      now: () => 1_700_000_000_123,
+    });
+
+    // 1. Initial invite forged by an unprivileged member/attacker (using real owner + owner_salt in payload) is rejected
+    await manager.acceptDirectInvite({
+      ...directInviteRumor(),
+      id: "20".repeat(32),
+      pubkey: attackerPubkey,
+    });
+    expect(currentHarness.persistedCommunities).toHaveLength(0);
+
+    // 2. Initial invite signed by community owner succeeds
+    await manager.acceptDirectInvite({
+      ...directInviteRumor(),
+      id: "21".repeat(32),
+      pubkey: OWNER,
+    });
+    expect(currentHarness.persistedCommunities).toHaveLength(1);
+
+    // 3. Attacker (regular community member) attempts to inject/hijack private Notifications channel key (epoch 99) -> rejected
+    const hijackedKey = "99".repeat(32);
+    const hijackAttempt: ConcordInviteBundle = {
+      ...bundle(),
+      channels: [
+        {
+          id: notificationsChannelId,
+          key: hijackedKey,
+          epoch: 99,
+          name: "Notifications",
+        },
+      ],
+    };
+    await manager.acceptDirectInvite({
+      ...directInviteRumor(hijackAttempt),
+      id: "22".repeat(32),
+      pubkey: attackerPubkey,
+    });
+    expect(
+      currentHarness.persistedCommunities[0]?.bundle.channels.find(
+        (c) => c.id === notificationsChannelId,
+      ),
+    ).toBeUndefined();
+
+    // 4. Invite signed by allow-listed npub in allowedInviterPubkeys succeeds
+    const validNotificationsInvite: ConcordInviteBundle = {
+      ...bundle(),
+      channels: [
+        {
+          id: notificationsChannelId,
+          key: PRIVATE_KEY,
+          epoch: 1,
+          name: "Notifications",
+        },
+      ],
+    };
+    await manager.acceptDirectInvite({
+      ...directInviteRumor(validNotificationsInvite),
+      id: "23".repeat(32),
+      pubkey: externalAdminPubkey,
+    });
+    expect(
+      currentHarness.persistedCommunities[0]?.bundle.channels.find(
+        (c) => c.id === notificationsChannelId,
+      ),
+    ).toEqual({
+      id: notificationsChannelId,
+      key: PRIVATE_KEY,
+      epoch: 1,
+      name: "Notifications",
+    });
+
+    // 5. Grant server-level Admin role to adminPubkey via Control stream, then rotate channel key via adminPubkey -> succeeds
+    const controlRead = deriveConcordGroupKey(
+      "concord/control",
+      Buffer.from(ROOT, "hex"),
+      Buffer.from(COMMUNITY_ID, "hex"),
+      2,
+    );
+    const controlGroup = {
+      ...controlRead,
+      secretKey: CONTROL_SIGNER_SECRET,
+      publicKey: CONTROL_PK,
+    };
+    const adminRoleId = "85".repeat(32);
+    const controlSub = findSubscription(CONTROL_PK);
+    await controlSub.handler(
+      createConcordStreamEvent(
+        OWNER_SECRET,
+        controlGroup,
+        {
+          kind: CONCORD_CONTROL_KIND,
+          content: JSON.stringify({
+            role_id: adminRoleId,
+            name: "Admin",
+            position: 1,
+            permissions: "0",
+            scope: { kind: "server" },
+          }),
+          tags: [["vsk", "1"], ["eid", adminRoleId], ["ev", "1"]],
+          created_at: 1_700_000_000,
+        },
+        { sealKind: 20014 },
+      ),
+    );
+    await controlSub.handler(
+      createConcordStreamEvent(
+        OWNER_SECRET,
+        controlGroup,
+        {
+          kind: CONCORD_CONTROL_KIND,
+          content: JSON.stringify({ member: adminPubkey, role_ids: [adminRoleId] }),
+          tags: [
+            ["vsk", "3"],
+            ["eid", computeConcordGrantLocator(COMMUNITY_ID, adminPubkey)],
+            ["ev", "1"],
+          ],
+          created_at: 1_700_000_001,
+        },
+        { sealKind: 20014 },
+      ),
+    );
+
+    const rotatedByFoldedAdminKey = "77".repeat(32);
+    await manager.acceptDirectInvite({
+      ...directInviteRumor({
+        ...bundle(),
+        channels: [
+          {
+            id: notificationsChannelId,
+            key: rotatedByFoldedAdminKey,
+            epoch: 2,
+            name: "Notifications",
+          },
+        ],
+      }),
+      id: "24".repeat(32),
+      pubkey: adminPubkey,
+    });
+    expect(
+      currentHarness.persistedCommunities[0]?.bundle.channels.find(
+        (c) => c.id === notificationsChannelId,
+      ),
+    ).toEqual({
+      id: notificationsChannelId,
+      key: rotatedByFoldedAdminKey,
+      epoch: 2,
+      name: "Notifications",
+    });
+  });
+
+  it("enforces allowedCommunityIds on both acceptDirectInvite and restoreCommunities", async () => {
+    const foreignOwnerSecret = generateSecretKey();
+    const foreignOwner = getPublicKey(foreignOwnerSecret);
+    const foreignSalt = "ab".repeat(32);
+    const foreignCommunityId = computeConcordCommunityId(foreignOwner, foreignSalt);
+    const foreignBundle: ConcordInviteBundle = {
+      ...bundle(),
+      community_id: foreignCommunityId,
+      owner: foreignOwner,
+      owner_salt: foreignSalt,
+    };
+
+    currentHarness.persistedCommunities.push({
+      bundle: foreignBundle,
+      joinPublished: true,
+    });
+
+    const restrictedManager = new ConcordCommunityManager({
+      secretKey: BOT_SECRET,
+      pubkey: BOT,
+      relayTransport: currentHarness.transport,
+      processMessage: currentHarness.processMessage,
+      isFreshEvent: currentHarness.isFreshEvent,
+      sendDirectMessage: currentHarness.sendDirectMessage,
+      allowedCommunityIds: [COMMUNITY_ID],
+      store: {
+        loadCommunities: () => [...currentHarness.persistedCommunities],
+        saveCommunity: (community) => {
+          currentHarness.persistedCommunities.push(community);
+        },
+      },
+      now: () => 1_700_000_000_123,
+    });
+
+    // Foreign persisted community is skipped on restoreCommunities
+    await restrictedManager.restoreCommunities();
+    expect(currentHarness.addRelays).not.toHaveBeenCalled();
+
+    // Direct invite for foreign community (even signed by foreignOwner) is rejected
+    await restrictedManager.acceptDirectInvite({
+      ...directInviteRumor(foreignBundle),
+      id: "30".repeat(32),
+      pubkey: foreignOwner,
+    });
+    expect(currentHarness.addRelays).not.toHaveBeenCalled();
+
+    // Direct invite for allow-listed COMMUNITY_ID signed by OWNER is accepted
+    await restrictedManager.acceptDirectInvite({
+      ...directInviteRumor(bundle()),
+      id: "31".repeat(32),
+      pubkey: OWNER,
+    });
+    expect(currentHarness.addRelays).toHaveBeenCalledWith(RELAYS);
+  });
 });
+
 
 
