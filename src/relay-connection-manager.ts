@@ -12,6 +12,7 @@ import type { RelayConnectionStatus } from "./types.js";
 
 const CONNECTION_TIMEOUT_MS = 3_000;
 const PUBLICATION_TIMEOUT_MS = 5_000;
+const STOP_DRAIN_TIMEOUT_MS = 5_000;
 const MAX_QUERY_EVENTS_PER_RELAY = 32;
 const INITIAL_RECONNECT_DELAY_MS = 1_000;
 const MAX_RECONNECT_DELAY_MS = 30_000;
@@ -111,6 +112,10 @@ export class RelayConnectionManager {
   private readonly liveSubscriptions = new Map<string, Map<number, RelaySubscriptionLike>>();
   private readonly pendingTasks = new Set<Promise<unknown>>();
   private readonly temporaryRelayReferences = new Map<string, number>();
+  private readonly inFlightRelayPublishes = new WeakMap<
+    RelayLike,
+    Map<string, Promise<string>>
+  >();
   private pool: RelayPoolLike | null = null;
   private active = false;
   private generation = 0;
@@ -433,7 +438,7 @@ export class RelayConnectionManager {
     }
 
     const results = await Promise.allSettled(
-      relays.map((relay) => Promise.resolve().then(() => relay.publish(event))),
+      relays.map((relay) => this.publishWithTimeout(relay, event)),
     );
     if (!results.some((result) => result.status === "fulfilled")) {
       throw new Error(RELAY_PUBLICATION_FAILED);
@@ -556,23 +561,38 @@ export class RelayConnectionManager {
   }
 
   private publishWithTimeout(relay: RelayLike, event: NostrEvent): Promise<string> {
-    return new Promise<string>((resolve, reject) => {
+    let relayInFlight = this.inFlightRelayPublishes.get(relay);
+    const existing = relayInFlight?.get(event.id);
+    if (existing) {
+      return existing;
+    }
+    if (!relayInFlight) {
+      relayInFlight = new Map();
+      this.inFlightRelayPublishes.set(relay, relayInFlight);
+    }
+    const publishPromise = new Promise<string>((resolve, reject) => {
       const timeout = setTimeout(
         () => reject(new Error(RELAY_PUBLICATION_FAILED)),
         PUBLICATION_TIMEOUT_MS,
       );
       timeout.unref?.();
-      void relay.publish(event).then(
-        (result) => {
-          clearTimeout(timeout);
-          resolve(result);
-        },
-        () => {
-          clearTimeout(timeout);
-          reject(new Error(RELAY_PUBLICATION_FAILED));
-        },
-      );
+      Promise.resolve()
+        .then(() => relay.publish(event))
+        .then(
+          (result) => {
+            clearTimeout(timeout);
+            resolve(result);
+          },
+          () => {
+            clearTimeout(timeout);
+            reject(new Error(RELAY_PUBLICATION_FAILED));
+          },
+        );
+    }).finally(() => {
+      relayInFlight?.delete(event.id);
     });
+    relayInFlight.set(event.id, publishPromise);
+    return publishPromise;
   }
 
   private trackTask<T>(task: Promise<T>): Promise<T> {
@@ -582,6 +602,19 @@ export class RelayConnectionManager {
     };
     void task.then(clearTask, clearTask);
     return task;
+  }
+
+  private async drainTasksBeforeClose(
+    connectionPromises: Array<Promise<void>>,
+    startPromise: Promise<void> | null,
+  ): Promise<void> {
+    await Promise.allSettled([
+      ...connectionPromises,
+      ...(startPromise ? [startPromise] : []),
+    ]);
+    while (this.pendingTasks.size > 0) {
+      await Promise.allSettled([...this.pendingTasks]);
+    }
   }
 
   private async stopLifecycle(): Promise<void> {
@@ -601,12 +634,19 @@ export class RelayConnectionManager {
     for (const controller of this.connectionControllers.values()) {
       controller.abort();
     }
-    await Promise.allSettled([
-      ...connectionPromises,
-      ...(startPromise ? [startPromise] : []),
-    ]);
-    while (this.pendingTasks.size > 0) {
-      await Promise.allSettled([...this.pendingTasks]);
+    let drainTimeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        this.drainTasksBeforeClose(connectionPromises, startPromise),
+        new Promise<void>((resolve) => {
+          drainTimeout = setTimeout(resolve, STOP_DRAIN_TIMEOUT_MS);
+          drainTimeout.unref?.();
+        }),
+      ]);
+    } finally {
+      if (drainTimeout) {
+        clearTimeout(drainTimeout);
+      }
     }
     try {
       pool?.close([

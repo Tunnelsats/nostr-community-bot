@@ -853,4 +853,67 @@ describe("RelayConnectionManager subscriptions and publishing", () => {
     expect(pool.ensureRelayCalls).toEqual([RELAYS[0]]);
     expect(pool.closeCalls).toEqual([]);
   });
+
+  it("times out an unresponsive active relay during publish instead of hanging indefinitely", async () => {
+    vi.useFakeTimers();
+    const fastRelay = new FakeRelay(async () => "saved");
+    const hungRelay = new FakeRelay(() => new Promise<string>(() => {}));
+    const relays = [fastRelay, hungRelay];
+    let nextRelay = 0;
+    const pool = new FakePool(async () => relays[nextRelay++]);
+    const manager = new RelayConnectionManager(RELAYS, () => pool);
+    await manager.start();
+
+    let settled = false;
+    const publishPromise = manager.publish(TEST_EVENT).then(() => {
+      settled = true;
+    });
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    await publishPromise;
+    expect(settled).toBe(true);
+  });
+
+  it("deduplicates concurrent in-flight publications of the same event ID on the same relay", async () => {
+    const inFlight = deferred<string>();
+    const relay = new FakeRelay(() => inFlight.promise);
+    const pool = new FakePool(async () => relay);
+    const manager = new RelayConnectionManager([RELAYS[0]], () => pool);
+    await manager.start();
+
+    const first = manager.publish(TEST_EVENT);
+    const second = manager.publish(TEST_EVENT);
+    await Promise.resolve();
+
+    expect(relay.publishCalls).toHaveLength(1);
+    inFlight.resolve("saved");
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      undefined,
+      undefined,
+    ]);
+  });
+
+  it("bounds pending task draining during stop so a hung handler cannot block shutdown forever", async () => {
+    vi.useFakeTimers();
+    const relay = new FakeRelay();
+    const pool = new FakePool(async () => relay);
+    const manager = new RelayConnectionManager([RELAYS[0]], () => pool);
+    manager.registerSubscription(
+      GIFT_WRAP_FILTER,
+      () => new Promise<void>(() => {}),
+    );
+    await manager.start();
+    relay.emit(TEST_EVENT);
+
+    let stopped = false;
+    const stopPromise = manager.stop().then(() => {
+      stopped = true;
+    });
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    await stopPromise;
+    expect(stopped).toBe(true);
+    expect(pool.closeCalls).toEqual([[RELAYS[0]]]);
+  });
 });
+
