@@ -329,19 +329,22 @@ export class ConcordCommunityManager {
     }
   }
 
-  public async acceptDirectInvite(rumor: ConcordRumor): Promise<void> {
+  public async acceptDirectInvite(rumor: ConcordRumor): Promise<boolean> {
     const task = this.inviteQueue.then(() => this.acceptDirectInviteSerial(rumor));
-    this.inviteQueue = task.catch(() => undefined);
+    this.inviteQueue = task.then(
+      () => undefined,
+      () => undefined,
+    );
     return task;
   }
 
-  private async acceptDirectInviteSerial(rumor: ConcordRumor): Promise<void> {
+  private async acceptDirectInviteSerial(rumor: ConcordRumor): Promise<boolean> {
     if (
       !this.accepting ||
       rumor.kind !== CONCORD_DIRECT_INVITE_KIND ||
       this.acceptedInvites.has(rumor.id)
     ) {
-      return;
+      return false;
     }
     if (!this.restoredFromStore && this.store) {
       try {
@@ -349,7 +352,7 @@ export class ConcordCommunityManager {
       } catch (error) {
         console.warn("[Concord] Deferred community store restore failed:", error);
       }
-      if (!this.accepting) return;
+      if (!this.accepting) return false;
     }
     console.log(`[Concord] Processing direct invite rumor ${rumor.id.slice(0, 8)}... from ${rumor.pubkey.slice(0, 8)}...`);
     let payload: unknown;
@@ -357,35 +360,35 @@ export class ConcordCommunityManager {
       payload = JSON.parse(rumor.content) as unknown;
     } catch {
       console.warn(`[Concord] Failed to parse direct invite payload in rumor ${rumor.id.slice(0, 8)}...`);
-      return;
+      return false;
     }
     const bundle = validateConcordInvite(payload, this.now());
     if (!bundle) {
       console.warn(`[Concord] Direct invite validation failed for rumor ${rumor.id.slice(0, 8)}...`);
-      return;
+      return false;
     }
     if (!this.isCommunityAllowed(bundle.community_id)) {
       console.warn(
         `[Concord] Rejected direct invite for non-allowlisted community ${bundle.community_id.slice(0, 8)}... from ${rumor.pubkey.slice(0, 8)}...`,
       );
-      return;
+      return false;
     }
     const existing = this.communities.get(bundle.community_id);
     if (!this.isInviteSenderAuthorized(rumor.pubkey, bundle, existing)) {
       console.warn(
         `[Concord] Rejected direct invite for community ${bundle.community_id.slice(0, 8)}... from unauthorized sender ${rumor.pubkey.slice(0, 8)}...`,
       );
-      return;
+      return false;
     }
     if (existing) {
       if (
         existing.bundle.control_pk !== bundle.control_pk ||
         existing.bundle.owner !== bundle.owner
       ) {
-        return;
+        return false;
       }
       if (bundle.root_epoch < existing.bundle.root_epoch) {
-        return;
+        return false;
       }
       const rootChanged =
         bundle.root_epoch > existing.bundle.root_epoch ||
@@ -409,7 +412,7 @@ export class ConcordCommunityManager {
       });
       if (!rootChanged && !hasNewRelays && !hasChannelUpdates && existing.joinPublished) {
         this.rememberInvite(rumor.id);
-        return;
+        return false;
       }
       const newChannels = bundle.channels.filter(
         (channel) => !existing.bundle.channels.some((held) => held.id === channel.id),
@@ -418,12 +421,12 @@ export class ConcordCommunityManager {
         this.channelSubscriptionCount() + newChannels.length >
         MAX_CONCORD_CHANNEL_SUBSCRIPTIONS
       ) {
-        return;
+        return false;
       }
       console.log(`[Concord] Accepted direct invite for community ${bundle.community_id.slice(0, 8)}... with ${bundle.channels.length} channel(s) across ${bundle.relays.length} relay(s)`);
       await this.relayTransport.addRelays(bundle.relays);
       console.log(`[Concord] Community relay registration completed for ${bundle.relays.length} relay(s)`);
-      if (!this.accepting) return;
+      if (!this.accepting) return false;
 
       if (rootChanged) {
         existing.bundle.root_epoch = bundle.root_epoch;
@@ -527,20 +530,20 @@ export class ConcordCommunityManager {
         joinPublished: existing.joinPublished,
       });
       this.rememberInvite(rumor.id);
-      return;
+      return true;
     }
     console.log(`[Concord] Accepted direct invite for community ${bundle.community_id.slice(0, 8)}... with ${bundle.channels.length} channel(s) across ${bundle.relays.length} relay(s)`);
-    if (this.communities.size >= MAX_COMMUNITIES) return;
+    if (this.communities.size >= MAX_COMMUNITIES) return false;
     if (
       this.channelSubscriptionCount() + bundle.channels.length >
       MAX_CONCORD_CHANNEL_SUBSCRIPTIONS
     ) {
-      return;
+      return false;
     }
 
     await this.relayTransport.addRelays(bundle.relays);
     console.log(`[Concord] Community relay registration completed for ${bundle.relays.length} relay(s)`);
-    if (!this.accepting) return;
+    if (!this.accepting) return false;
     const state = this.registerCommunityState(bundle, false);
     await this.store?.saveCommunity({
       bundle: state.bundle,
@@ -554,6 +557,7 @@ export class ConcordCommunityManager {
       joinPublished: true,
     });
     this.rememberInvite(rumor.id);
+    return true;
   }
 
   private registerCommunityState(

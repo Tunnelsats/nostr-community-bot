@@ -619,6 +619,8 @@ export class NostrCommunityBot {
     return true;
   }
 
+  private manifestSyncPromise: Promise<void> | null = null;
+
   public async start(): Promise<void> {
     this.acceptingRelayEvents = true;
     try {
@@ -642,18 +644,29 @@ export class NostrCommunityBot {
     if (!this.acceptingRelayEvents || !this.botManifestConfig?.enabled) {
       return;
     }
-    if (this.botManifestConfig.publishBotProfileFlag !== false) {
-      try {
-        await this.ensureBotProfileFlag();
-      } catch (error) {
-        console.warn("[Nostr] Failed to ensure Kind 0 bot profile flag:", error);
+    if (this.manifestSyncPromise) {
+      return this.manifestSyncPromise;
+    }
+    const syncTask = (async () => {
+      if (this.botManifestConfig?.publishBotProfileFlag !== false) {
+        try {
+          await this.ensureBotProfileFlag();
+        } catch (error) {
+          console.warn("[Nostr] Failed to ensure Kind 0 bot profile flag:", error);
+        }
       }
-    }
-    try {
-      await this.publishBotManifest();
-    } catch (error) {
-      console.warn("[Nostr] Failed to publish Kind 10304 bot command manifest:", error);
-    }
+      try {
+        await this.publishBotManifest();
+      } catch (error) {
+        console.warn("[Nostr] Failed to publish Kind 10304 bot command manifest:", error);
+      }
+    })().finally(() => {
+      if (this.manifestSyncPromise === syncTask) {
+        this.manifestSyncPromise = null;
+      }
+    });
+    this.manifestSyncPromise = syncTask;
+    return syncTask;
   }
 
   public async stop(): Promise<void> {
@@ -824,9 +837,9 @@ export class NostrCommunityBot {
       try {
         const invite = unwrapDirectInvite(event, this.secretKey, this.pubkeyHex);
         if (!this.acceptingRelayEvents) return;
-        await this.concordManager.acceptDirectInvite(invite);
+        const accepted = await this.concordManager.acceptDirectInvite(invite);
         this.rememberEvent(event.id);
-        if (this.botManifestConfig?.enabled) {
+        if (accepted && this.botManifestConfig?.enabled) {
           await this.syncBotProfileAndManifest();
         }
       } catch {

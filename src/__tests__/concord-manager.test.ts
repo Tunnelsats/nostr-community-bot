@@ -1728,11 +1728,12 @@ describe("ConcordCommunityManager", () => {
       ...bundle(),
       channels: [],
     };
-    await startupManager.acceptDirectInvite({
+    const replayAccepted = await startupManager.acceptDirectInvite({
       ...directInviteRumor(emptyInviteBundle),
       id: "08".repeat(32),
       pubkey: OWNER,
     });
+    expect(replayAccepted).toBe(false);
 
     await startupManager.restoreCommunities();
 
@@ -1756,3 +1757,4 @@ describe("ConcordCommunityManager", () => {
     expect(currentHarness.publishToRelays).toHaveBeenCalledTimes(1);
   });
 });
+
