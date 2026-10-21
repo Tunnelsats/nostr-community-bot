@@ -1023,7 +1023,7 @@ describe("ConcordCommunityManager", () => {
     }
   });
 
-  it("suppresses startup log spam for historical or duplicate stream wraps and logs fresh Kind 9 messages once", async () => {
+  it("suppresses startup log spam for historical or non-command Kind 9 messages and logs fresh channel commands once", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
     try {
       await currentHarness.manager.acceptDirectInvite(directInviteRumor());
@@ -1051,6 +1051,23 @@ describe("ConcordCommunityManager", () => {
       expect(logSpy).not.toHaveBeenCalledWith(
         expect.stringContaining("[Concord] Decrypted Kind 9 message"),
       );
+      expect(logSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining("[Concord] Dispatching channel command"),
+      );
+
+      const chatWrap = createConcordStreamEvent(MEMBER_SECRET, group, {
+        kind: 9,
+        content: "hello everyone in the channel",
+        tags: [["channel", PRIVATE_CHANNEL], ["epoch", "4"]],
+        created_at: 1_700_000_015,
+      });
+      await channelSub.handler(chatWrap);
+      expect(logSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining("[Concord] Decrypted Kind 9 message"),
+      );
+      expect(logSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining("[Concord] Dispatching channel command"),
+      );
 
       const freshWrap = createConcordStreamEvent(MEMBER_SECRET, group, {
         kind: 9,
@@ -1061,10 +1078,13 @@ describe("ConcordCommunityManager", () => {
       await channelSub.handler(freshWrap);
       await channelSub.handler(freshWrap);
 
-      const decryptedLogs = logSpy.mock.calls.filter(([msg]) =>
-        typeof msg === "string" && msg.includes("[Concord] Decrypted Kind 9 message"),
+      expect(logSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining("[Concord] Decrypted Kind 9 message"),
       );
-      expect(decryptedLogs).toHaveLength(1);
+      const dispatchLogs = logSpy.mock.calls.filter(([msg]) =>
+        typeof msg === "string" && msg.includes("[Concord] Dispatching channel command /ping"),
+      );
+      expect(dispatchLogs).toHaveLength(1);
     } finally {
       logSpy.mockRestore();
     }
