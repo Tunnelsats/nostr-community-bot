@@ -1118,7 +1118,6 @@ export class ConcordCommunityManager {
     if (!decoded || !this.rememberWrap(event.id)) return;
     if (decoded.author === this.pubkey) return;
     if (!this.isFreshEvent(decoded.rumor.created_at)) return;
-    console.log(`[Concord] Decrypted Kind 9 message ${decoded.rumor.id.slice(0, 8)}... from ${decoded.author.slice(0, 8)}... in channel ${channel.channelId.slice(0, 8)}...`);
 
     if (hasWireGuardLeak(decoded.rumor.content)) {
       if (state.control.canManageMessages(this.pubkey, decoded.author, channel.channelId)) {
