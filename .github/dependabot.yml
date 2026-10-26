@@ -17,6 +17,8 @@ updates:
       - "dependencies"
       - "javascript"
       - "npm"
+    commit-message:
+      prefix: "chore(deps)"
 
   - package-ecosystem: "github-actions"
     directory: "/"
@@ -24,4 +26,6 @@ updates:
       interval: "weekly"
     labels:
       - "dependencies"
-      - "actions"
+      - "github-actions"
+    commit-message:
+      prefix: "chore(ci)"
