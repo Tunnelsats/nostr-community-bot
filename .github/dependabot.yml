@@ -4,6 +4,8 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 3
     open-pull-requests-limit: 10
     groups:
       # One weekly PR for all minor and patch updates; major updates stay separate PRs.
@@ -24,6 +26,8 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 3
     labels:
       - "dependencies"
       - "github-actions"
