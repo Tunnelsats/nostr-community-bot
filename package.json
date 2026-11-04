@@ -32,17 +32,17 @@
   },
   "dependencies": {
     "@noble/hashes": "^2.4.0",
-    "nostr-tools": "^2.25.2",
-    "ws": "^8.22.0"
+    "nostr-tools": "^2.25.4",
+    "ws": "^8.22.1"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@types/node": "^26.6.5",
+    "@types/node": "^26.6.6",
     "@types/ws": "^8.18.2",
-    "eslint": "^10.13.0",
+    "eslint": "^10.14.0",
     "prettier": "^3.9.10",
     "typescript": "^5.5.4",
-    "typescript-eslint": "^8.72.0",
+    "typescript-eslint": "^8.72.1",
     "vitest": "^5.0.5"
   },
   "engines": {
