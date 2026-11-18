@@ -33,16 +33,16 @@
   "dependencies": {
     "@noble/hashes": "^2.4.0",
     "nostr-tools": "^2.26.0",
-    "ws": "^8.22.1"
+    "ws": "^8.23.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@types/node": "^26.6.6",
     "@types/ws": "^8.18.2",
-    "eslint": "^10.14.0",
-    "prettier": "^3.9.10",
+    "eslint": "^10.15.0",
+    "prettier": "^3.10.1",
     "typescript": "^5.5.4",
-    "typescript-eslint": "^8.72.1",
+    "typescript-eslint": "^8.72.2",
     "vitest": "^5.1.0"
   },
   "engines": {
