@@ -32,7 +32,7 @@
   },
   "dependencies": {
     "@noble/hashes": "^2.4.0",
-    "nostr-tools": "^2.26.0",
+    "nostr-tools": "^2.26.1",
     "ws": "^8.23.0"
   },
   "devDependencies": {
@@ -42,8 +42,8 @@
     "eslint": "^10.15.0",
     "prettier": "^3.10.1",
     "typescript": "^5.5.4",
-    "typescript-eslint": "^8.72.2",
-    "vitest": "^5.1.0"
+    "typescript-eslint": "^8.73.0",
+    "vitest": "^5.1.1"
   },
   "engines": {
     "node": ">=22.23.4"
